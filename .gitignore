@@ -1,28 +1,25 @@
-.venv
-__pycache__
+# Python
+__pycache__/
 *.pyc
 *.pyo
-*.pyd
-*.db
-*.sqlite3
-*.log
-.DS_Store
-.idea/
-.vscode/
-*.env
 *.egg-info/
-dist/
-build/
-*.egg
-*.tar.gz
-*.whl
-coverage.xml
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-.pyre/
-.pytype/
-.pyre_check/
-.pytype_check/
-.pyre_configuration/
-.pytype_configuration/
+venv/
+.venv/
+
+# Aufnahmen & Screenshots
+aufnahme_*.mp4
+screenshot_*.jpg
+~/Aufnahmen/
+
+# System
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# Output/Debug
+output.txt

@@ -1,108 +1,276 @@
+"""
+PTZ-Steuerung für Hiseeu HD118-PZ — Fußball-Aufnahme
+=====================================================
+Optimiert für minimale Latenz bei der Live-Vorschau und maximale
+Qualität bei der Aufnahme.
+
+Steuerung:
+  - Joystick X/Y    → Pan/Tilt
+  - Poti (CH0)      → Zoom
+  - Button kurz     → Screenshot
+  - Button lang 3s  → Aufnahme Start/Stop
+
+Latenz-Optimierungen:
+  - Live-Vorschau über Sub-Stream (niedrigere Auflösung, weniger Daten)
+  - mpv mit aggressiven Low-Latency-Einstellungen
+  - PTZ-Befehle nur bei Änderung (kein Spam bei Stillstand)
+  - Aufnahme immer über Main-Stream in voller 4K-Qualität
+"""
+
 import time
+import os
 import subprocess
 import threading
+import signal
+import sys
+import requests
+from requests.auth import HTTPDigestAuth
 from onvif import ONVIFCamera
 from gpiozero import MCP3008, Button
-# Overlay für Aufnahmeanzeige
 import tkinter as tk
 
-# --- Kamera-Zugangsdaten ---
+# ============================================================
+# Konfiguration
+# ============================================================
 CAMERA_IP = '192.168.178.122'
-CAMERA_PORT = 8899
+CAMERA_PORT = 8899           # ONVIF-Port
 USERNAME = 'admin'
 PASSWORD = ''
-RTSP_URL = f"rtsp://{USERNAME}:{PASSWORD}@{CAMERA_IP}:554/stream"
 
-# --- GPIO / ADC Pins ---
+# RTSP-Streams — Main-Stream für Aufnahme, Sub-Stream für Live-Vorschau
+# Der Sub-Stream hat niedrigere Auflösung → weniger Daten → weniger Latenz
+RTSP_MAIN = f"rtsp://{USERNAME}:{PASSWORD}@{CAMERA_IP}:554/stream"
+RTSP_SUB  = f"rtsp://{USERNAME}:{PASSWORD}@{CAMERA_IP}:554/stream2"
+
+# Aufnahme-Ordner
+RECORDING_DIR = os.path.expanduser("~/Aufnahmen")
+os.makedirs(RECORDING_DIR, exist_ok=True)
+
+# GPIO / ADC Pins (MCP3008 über SPI)
 BTN_PIN = 17
-pot = MCP3008(channel=0)   # Zoom
-joy_y = MCP3008(channel=2)
-joy_x = MCP3008(channel=3)
+pot   = MCP3008(channel=0)   # Zoom-Poti
+joy_y = MCP3008(channel=2)   # Joystick Y-Achse
+joy_x = MCP3008(channel=3)   # Joystick X-Achse
 joy_btn = Button(BTN_PIN, pull_up=True)
 
-# --- PTZ Kamera Setup ---
-cam = ONVIFCamera(CAMERA_IP, CAMERA_PORT, USERNAME, PASSWORD)
-media_service = cam.create_media_service()
-ptz_service = cam.create_ptz_service()
-profiles = media_service.GetProfiles()
-profile = profiles[0]
+# PTZ-Einstellungen
+PAN_MAX  = 1.0
+TILT_MAX = 1.0
+ZOOM_MAX = 1.0
+DEADZONE = 0.08    # etwas größere Deadzone → weniger Jitter
+ZOOM_DEADZONE_LO = 400   # Poti-Mittelbereich (kein Zoom)
+ZOOM_DEADZONE_HI = 600
+LOOP_SLEEP = 0.05  # 20 Hz Steuer-Loop reicht für flüssige Kontrolle
 
-# --- Aufnahme / Stream ---
+# ============================================================
+# Globale Variablen
+# ============================================================
 recording = False
 running = True
 stream_proc = None
 ffmpeg_proc = None
-# Overlay Thread
 overlay_thread = None
 overlay_running = False
 
-# --- PTZ Einstellungen ---
-PAN_MAX = 1.0
-TILT_MAX = 1.0
-ZOOM_MAX = 1.0
-DEADZONE = 0.05
-ZOOM_MIN = 1
-ZOOM_MAX_STEPS = 30
-LOOP_SLEEP = 0.04
+# ============================================================
+# ONVIF Kamera-Setup
+# ============================================================
+print("Verbinde mit Kamera über ONVIF...")
+cam = ONVIFCamera(CAMERA_IP, CAMERA_PORT, USERNAME, PASSWORD)
+media_service = cam.create_media_service()
+ptz_service   = cam.create_ptz_service()
+profiles = media_service.GetProfiles()
+profile  = profiles[0]
+print(f"Verbunden. Profil: {profile.Name}")
 
+# ============================================================
+# KI-Tracking deaktivieren
+# ============================================================
+def disable_ai_tracking():
+    """
+    Versucht das integrierte KI-Tracking/Auto-Tracking der Kamera
+    über verschiedene Wege zu deaktivieren:
+    1. HTTP-CGI-Befehle (typisch für Hiseeu/HiSilicon-Kameras)
+    2. ONVIF-Analytics
+    """
+    print("Versuche KI-Tracking zu deaktivieren...")
+    auth = HTTPDigestAuth(USERNAME, PASSWORD) if PASSWORD else None
+    base = f"http://{CAMERA_IP}"
+
+    # Verschiedene CGI-Endpunkte die bei Hiseeu-Kameras funktionieren können
+    cgi_attempts = [
+        # Humanoid / Smart-Detection deaktivieren
+        f"{base}/cgi-bin/param.cgi?cmd=setSmartAlarm&-smd_enable=0&-humanoid_enable=0",
+        f"{base}/cgi-bin/param.cgi?cmd=setSmartAlarm&-ai_enable=0",
+        # Auto-Tracking deaktivieren
+        f"{base}/cgi-bin/param.cgi?cmd=setAutoTrack&-enable=0",
+        f"{base}/cgi-bin/param.cgi?cmd=setPTZAutoTrack&-enable=0",
+        # Alternativer Pfad
+        f"{base}/cgi-bin/configManager.cgi?action=setConfig&SmartDetect.Enable=false",
+        f"{base}/cgi-bin/configManager.cgi?action=setConfig&VideoAnalyseRule[0].Enable=false",
+        # XM/Hiseeu spezifisch
+        f"{base}/cgi-bin/hi3510/param.cgi?cmd=sethumanaliarmattr&-enable=0",
+    ]
+
+    success = False
+    for url in cgi_attempts:
+        try:
+            r = requests.get(url, auth=auth, timeout=3)
+            if r.status_code == 200 and 'error' not in r.text.lower():
+                print(f"  ✓ Erfolgreich: {url.split('?')[1][:50]}")
+                success = True
+        except requests.exceptions.RequestException:
+            pass
+
+    # ONVIF Analytics versuchen
+    try:
+        analytics = cam.create_analytics_service()
+        configs = analytics.GetAnalyticsEngineConfigs()
+        for config in configs:
+            try:
+                # Versuche alle Analytics-Rules zu deaktivieren
+                analytics.DeleteRules({'ConfigurationToken': config.token})
+                print(f"  ✓ ONVIF Analytics-Rules gelöscht für {config.token}")
+                success = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not success:
+        print("  ⚠ KI-Tracking konnte nicht automatisch deaktiviert werden.")
+        print("    → Bitte manuell im Kamera-Webinterface deaktivieren:")
+        print(f"    → http://{CAMERA_IP}")
+        print("    → Unter: Einstellungen → Smart/AI → Tracking → AUS")
+    else:
+        print("  KI-Tracking deaktiviert.")
+
+# ============================================================
+# Aufnahme (Main-Stream in voller Qualität)
+# ============================================================
 def start_recording():
     global ffmpeg_proc, recording, overlay_thread, overlay_running
-    if ffmpeg_proc is None:
-        filename = time.strftime('aufnahme_%Y%m%d_%H%M%S.mp4')
-        cmd = ['ffmpeg', '-i', RTSP_URL, '-c:v', 'copy', '-an', filename]
-        ffmpeg_proc = subprocess.Popen(cmd)
-        recording = True
-        print(f"Aufnahme gestartet: {filename}")
-        # Overlay starten
-        overlay_running = True
-        overlay_thread = threading.Thread(target=show_overlay, daemon=True)
-        overlay_thread.start()
+    if ffmpeg_proc is not None:
+        return
+    filename = time.strftime('aufnahme_%Y%m%d_%H%M%S.mp4')
+    filepath = os.path.join(RECORDING_DIR, filename)
+    cmd = [
+        'ffmpeg',
+        '-rtsp_transport', 'tcp',     # TCP ist stabiler als UDP
+        '-i', RTSP_MAIN,              # Main-Stream für volle Qualität
+        '-c:v', 'copy',               # Kein Re-Encoding → keine CPU-Last
+        '-c:a', 'aac',                # Audio konvertieren (pcm_alaw → aac)
+        '-movflags', '+faststart',    # Schnelleres Abspielen nach Aufnahme
+        '-y', filepath
+    ]
+    ffmpeg_proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    recording = True
+    print(f"🔴 Aufnahme gestartet: {filepath}")
+    # Overlay starten
+    overlay_running = True
+    overlay_thread = threading.Thread(target=show_overlay, daemon=True)
+    overlay_thread.start()
 
 def stop_recording():
     global ffmpeg_proc, recording, overlay_running
-    if ffmpeg_proc is not None:
+    if ffmpeg_proc is None:
+        return
+    # Sauberes Beenden mit SIGINT → ffmpeg schreibt Container-Ende
+    ffmpeg_proc.send_signal(signal.SIGINT)
+    try:
+        ffmpeg_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
         ffmpeg_proc.terminate()
         ffmpeg_proc.wait()
-        ffmpeg_proc = None
-        recording = False
-        print("Aufnahme gestoppt.")
-        # Overlay stoppen
-        overlay_running = False
+    ffmpeg_proc = None
+    recording = False
+    overlay_running = False
+    print("⬛ Aufnahme gestoppt.")
 
-# --- Screenshot Funktion ---
+# ============================================================
+# Screenshot
+# ============================================================
 def take_screenshot():
     filename = time.strftime('screenshot_%Y%m%d_%H%M%S.jpg')
-    cmd = ['ffmpeg', '-y', '-i', RTSP_URL, '-frames:v', '1', filename]
-    subprocess.run(cmd)
-    print(f"Screenshot aufgenommen: {filename}")
+    filepath = os.path.join(RECORDING_DIR, filename)
+    cmd = [
+        'ffmpeg', '-y',
+        '-rtsp_transport', 'tcp',
+        '-i', RTSP_MAIN,
+        '-frames:v', '1',
+        '-q:v', '2',
+        filepath
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"📸 Screenshot: {filepath}")
 
-# --- Stream Anzeige ---
-# --- Stream Anzeige ---
-
+# ============================================================
+# Live-Vorschau (Sub-Stream, Low-Latency)
+# ============================================================
 def show_stream():
+    """
+    Zeigt den Sub-Stream mit aggressiven Low-Latency-Einstellungen.
+    Falls der Sub-Stream nicht verfügbar ist, fällt es auf den
+    Main-Stream zurück (mit Latenz-Optimierungen).
+    """
     global stream_proc
-    cmd = ['mpv', '-fs', RTSP_URL]
-    stream_proc = subprocess.Popen(cmd)
-    stream_proc.wait()
 
-# --- Overlay Anzeige ---
+    # mpv Low-Latency Konfiguration
+    cmd = [
+        'mpv',
+        '--fullscreen',
+        '--no-audio',                       # Audio weglassen → weniger Puffer
+        '--profile=low-latency',            # mpv eingebautes Low-Latency-Profil
+        '--untimed',                        # Frames sofort anzeigen
+        '--no-cache',                       # Kein Cache
+        '--cache-pause=no',                 # Nie pausieren um zu puffern
+        '--demuxer-lavf-o=fflags=+nobuffer+fastseek', # ffmpeg: kein Puffer
+        '--demuxer-lavf-o=rtsp_transport=tcp',        # TCP statt UDP
+        '--demuxer-readahead-secs=0',       # Kein Vorauslesen
+        '--interpolation=no',               # Kein Frame-Interpolation
+        '--video-sync=audio',               # Kein Audio → Display-Sync
+        '--video-latency-hacks=yes',        # Experimentelle Latenz-Hacks
+        '--vd-lavc-threads=4',              # Mehr Decoder-Threads
+        '--hwdec=auto-safe',                # Hardware-Decoding wenn möglich
+        '--force-seekable=no',              # Kein Seeking → Live
+        f'--title=PTZ Live',
+        RTSP_SUB                            # Sub-Stream verwenden!
+    ]
+
+    print(f"Starte Live-Vorschau (Sub-Stream)...")
+    stream_proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+    retcode = stream_proc.wait()
+
+    # Fallback auf Main-Stream wenn Sub-Stream nicht verfügbar
+    if retcode != 0:
+        print("Sub-Stream nicht verfügbar, versuche Main-Stream...")
+        cmd[-1] = RTSP_MAIN
+        stream_proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+        stream_proc.wait()
+
+# ============================================================
+# Aufnahme-Overlay (blinkendes "● Aufnahme")
+# ============================================================
 def show_overlay():
     root = tk.Tk()
     root.overrideredirect(True)
     root.attributes('-topmost', True)
     root.attributes('-alpha', 0.7)
     root.configure(bg='black')
-    # Bildschirmgröße ermitteln
     screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    # Fenstergröße und Position oben rechts
     w, h = 220, 60
     x = screen_width - w - 10
     y = 10
     root.geometry(f'{w}x{h}+{x}+{y}')
-    label = tk.Label(root, text='● Aufnahme PTZ', font=('Arial', 20, 'bold'), fg='red', bg='black')
+    label = tk.Label(
+        root, text='● Aufnahme PTZ',
+        font=('Arial', 20, 'bold'), fg='red', bg='black'
+    )
     label.pack(expand=True, fill='both')
     blink = True
+
     def update():
         nonlocal blink
         if not overlay_running:
@@ -111,10 +279,13 @@ def show_overlay():
         label.config(fg='red' if blink else 'black')
         blink = not blink
         root.after(500, update)
+
     update()
     root.mainloop()
 
-# --- PTZ Steuerung ---
+# ============================================================
+# PTZ-Steuerung — nur bei Änderung senden!
+# ============================================================
 def send_continuous_move(pan, tilt, zoom_speed):
     try:
         req = ptz_service.create_type('ContinuousMove')
@@ -125,15 +296,17 @@ def send_continuous_move(pan, tilt, zoom_speed):
         }
         ptz_service.ContinuousMove(req)
     except Exception as e:
-        print("ContinuousMove Fehler:", e)
+        print(f"PTZ ContinuousMove Fehler: {e}")
 
 def send_stop():
     try:
         ptz_service.Stop({'ProfileToken': profile.token})
     except Exception as e:
-        print("Stop Fehler:", e)
+        print(f"PTZ Stop Fehler: {e}")
 
-# --- Steuerungs-Loop ---
+# ============================================================
+# Steuerungs-Loop
+# ============================================================
 def control_loop():
     global running, recording
 
@@ -141,43 +314,64 @@ def control_loop():
     btn_press_time = None
     btn_action_done = False
 
+    # Zustand merken → nur bei Veränderung Befehle senden
+    prev_moving = False
+    prev_pan = 0.0
+    prev_tilt = 0.0
+    prev_zoom = 0.0
+    change_threshold = 0.03   # Minimale Änderung bevor neuer Befehl gesendet wird
+
     while running:
-        # Werte vom Joystick (0..1023)
-        raw_x = int(joy_x.value * 1023)
-        raw_y = int(joy_y.value * 1023)
+        # Joystick/Poti auslesen (0.0 .. 1.0 → normalisiert auf -1.0 .. 1.0)
+        raw_x = joy_x.value
+        raw_y = joy_y.value
         raw_z = int(pot.value * 1023)
 
-        pan = (raw_x / 1023 * 2 - 1) * PAN_MAX
-        tilt = (raw_y / 1023 * 2 - 1) * TILT_MAX
+        pan  = (raw_x * 2.0 - 1.0) * PAN_MAX
+        tilt = (raw_y * 2.0 - 1.0) * TILT_MAX
 
+        # Deadzone anwenden
         if abs(pan) < DEADZONE:
             pan = 0.0
         if abs(tilt) < DEADZONE:
             tilt = 0.0
 
+        # Zoom aus Poti (Mittelstellung = kein Zoom)
         zoom_speed = 0.0
-        if raw_z < 400:
-            zoom_speed = - (400 - raw_z) / 400 * ZOOM_MAX
-        elif raw_z > 600:
-            zoom_speed = (raw_z - 600) / (1023 - 600) * ZOOM_MAX
-        else:
-            zoom_speed = 0.0
+        if raw_z < ZOOM_DEADZONE_LO:
+            zoom_speed = -(ZOOM_DEADZONE_LO - raw_z) / ZOOM_DEADZONE_LO * ZOOM_MAX
+        elif raw_z > ZOOM_DEADZONE_HI:
+            zoom_speed = (raw_z - ZOOM_DEADZONE_HI) / (1023 - ZOOM_DEADZONE_HI) * ZOOM_MAX
 
-        if pan != 0.0 or tilt != 0.0 or zoom_speed != 0.0:
-            send_continuous_move(pan, tilt, zoom_speed)
-        else:
+        # Ist Bewegung aktiv?
+        is_moving = (pan != 0.0 or tilt != 0.0 or zoom_speed != 0.0)
+
+        # Nur senden wenn sich etwas geändert hat
+        if is_moving:
+            value_changed = (
+                abs(pan - prev_pan) > change_threshold or
+                abs(tilt - prev_tilt) > change_threshold or
+                abs(zoom_speed - prev_zoom) > change_threshold
+            )
+            if not prev_moving or value_changed:
+                send_continuous_move(pan, tilt, zoom_speed)
+                prev_pan = pan
+                prev_tilt = tilt
+                prev_zoom = zoom_speed
+        elif prev_moving:
+            # War in Bewegung, jetzt Stillstand → einmal Stop senden
             send_stop()
 
-        # Button-Logik
+        prev_moving = is_moving
+
+        # ---- Button-Logik (kurz = Screenshot, lang = Aufnahme) ----
         btn_state = joy_btn.is_pressed
         now = time.time()
 
         if btn_state and not btn_last_state:
-            # Button wurde gerade gedrückt
             btn_press_time = now
             btn_action_done = False
         elif btn_state and btn_press_time is not None:
-            # Button wird gehalten
             if not btn_action_done and now - btn_press_time > 3.0:
                 if not recording:
                     start_recording()
@@ -185,32 +379,56 @@ def control_loop():
                     stop_recording()
                 btn_action_done = True
         elif not btn_state and btn_last_state:
-            # Button wurde losgelassen
             if btn_press_time is not None and not btn_action_done:
-                duration = now - btn_press_time
-                if duration < 3.0:
+                if now - btn_press_time < 3.0:
                     take_screenshot()
             btn_press_time = None
             btn_action_done = False
 
         btn_last_state = btn_state
-        time.sleep(0.04)
+        time.sleep(LOOP_SLEEP)
 
-# --- Main ---
+# ============================================================
+# Sauberes Beenden
+# ============================================================
+def cleanup(signum=None, frame=None):
+    global running
+    running = False
+    print("\nBeende...")
+    stop_recording()
+    if stream_proc is not None:
+        stream_proc.terminate()
+    send_stop()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup)
+signal.signal(signal.SIGTERM, cleanup)
+
+# ============================================================
+# Main
+# ============================================================
 if __name__ == "__main__":
+    # KI-Tracking beim Start deaktivieren
+    disable_ai_tracking()
+
+    print("Starte PTZ-Steuerung...")
+    print("  Joystick → Pan/Tilt")
+    print("  Poti     → Zoom")
+    print("  Button kurz  → Screenshot")
+    print("  Button 3s    → Aufnahme Start/Stop")
+    print()
+
+    t_stream  = threading.Thread(target=show_stream, daemon=True)
+    t_control = threading.Thread(target=control_loop, daemon=True)
+
+    t_stream.start()
+    t_control.start()
+
+    # Warten bis Stream-Fenster geschlossen wird
     try:
-        t_stream = threading.Thread(target=show_stream, daemon=True)
-        t_stream.start()
-
-        t_control = threading.Thread(target=control_loop, daemon=True)
-        t_control.start()
-
         while t_stream.is_alive():
-            time.sleep(0.1)
-
+            time.sleep(0.2)
     except KeyboardInterrupt:
-        running = False
-        stop_recording()
-        if stream_proc is not None:
-            stream_proc.terminate()
-        print("Beendet.")
+        pass
+
+    cleanup()
