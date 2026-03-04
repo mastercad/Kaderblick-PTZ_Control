@@ -74,30 +74,38 @@ def xm_hash_password(password):
 
 def build_xm_packet(msg_id, session_id, data_bytes):
     """
-    Baut ein XM-Protokoll-Paket:
+    Baut ein XM/DVRIP-Protokoll-Paket:
     Header (20 Bytes) + Daten
-    """
-    head_flag = XM_HEADER
-    version = XM_VERSION
-    reserved1 = 0
-    reserved2 = 0
-    seq = 0
-    total_len = len(data_bytes)
 
-    # 20-Byte Header: head_flag(1) + version(1) + reserved(2) +
-    #                 session_id(4) + seq(4) + total_len(4) + msg_id(2) + reserved(2)
-    header = struct.pack('<BBHI IIH H',
-                         head_flag, version, reserved1,
-                         session_id,
-                         seq,
-                         total_len,
-                         msg_id,
-                         reserved2)
+    Header-Layout:
+      Byte  0:     0xFF (Head flag)
+      Byte  1:     Version (0x00 oder 0x01)
+      Byte  2-3:   Reserved (2× uint8)
+      Byte  4-7:   Session ID (uint32 LE)
+      Byte  8-11:  Sequence number (uint32 LE)
+      Byte  12:    Total packets (uint8)
+      Byte  13:    Current packet (uint8)
+      Byte  14-15: Message ID (uint16 LE)
+      Byte  16-19: Data length (uint32 LE)
+    """
+    header = struct.pack(
+        '<BBBB I I BB H I',
+        XM_HEADER,          # Byte 0:  Head flag
+        0x00,               # Byte 1:  Version (0x00 für Login)
+        0x00,               # Byte 2:  Reserved
+        0x00,               # Byte 3:  Reserved
+        session_id,         # Byte 4-7:  Session ID
+        0,                  # Byte 8-11: Sequence
+        0,                  # Byte 12: Total packets
+        0,                  # Byte 13: Current packet
+        msg_id,             # Byte 14-15: Message ID
+        len(data_bytes),    # Byte 16-19: Data length
+    )
     return header + data_bytes
 
 
 def parse_xm_response(sock, timeout=5):
-    """Empfängt und parst eine XM-Protokoll-Antwort."""
+    """Empfängt und parst eine XM/DVRIP-Protokoll-Antwort."""
     sock.settimeout(timeout)
     try:
         # Header lesen (20 Bytes)
@@ -109,17 +117,24 @@ def parse_xm_response(sock, timeout=5):
             header += chunk
 
         # Header parsen
-        (head_flag, version, reserved1,
-         session_id, seq, total_len,
-         msg_id, reserved2) = struct.unpack('<BBHI IIH H', header)
+        (head_flag, version, res1, res2,
+         session_id, seq,
+         total_pkts, cur_pkt,
+         msg_id,
+         data_len) = struct.unpack('<BBBB I I BB H I', header)
 
         if head_flag != XM_HEADER:
-            return msg_id, session_id, f"Ungültiger Header: {head_flag:#x}"
+            # Debug: Was kam stattdessen?
+            return msg_id, session_id, (
+                f"Ungültiger Header: erstes Byte={head_flag:#04x}, "
+                f"raw={header[:8].hex()}"
+            )
 
         # Daten lesen
         data = b''
-        while len(data) < total_len:
-            chunk = sock.recv(total_len - len(data))
+        remaining = data_len
+        while len(data) < remaining:
+            chunk = sock.recv(min(remaining - len(data), 4096))
             if not chunk:
                 break
             data += chunk
@@ -166,63 +181,157 @@ def test_port_reachable():
         return False
 
 
+def test_raw_probe():
+    """Test 1b: Rohe Verbindung — was sendet die Kamera von sich aus?"""
+    print()
+    print("=" * 60)
+    print("Test 1b: Raw-Probe — was kommt von der Kamera?")
+    print("=" * 60)
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((CAMERA_IP, XM_PORT))
+
+        # Warte ob die Kamera von sich aus etwas sendet
+        try:
+            data = sock.recv(512)
+            if data:
+                print(f"  Kamera sendet {len(data)} Bytes bei Verbindung:")
+                print(f"    Hex: {data[:40].hex()}")
+                print(f"    Raw: {data[:60]!r}")
+                if data[0] == 0xFF:
+                    print("    → Sieht nach XM-Header aus (0xFF)")
+                else:
+                    print(f"    → Erstes Byte: {data[0]:#04x} (kein XM-Header)")
+            else:
+                print("  Kamera sendet nichts von sich aus (erwartet)")
+        except socket.timeout:
+            print("  Kamera sendet nichts von sich aus (erwartet)")
+
+        # Sende etwas Müll und schaue was zurückkommt
+        print("\n  Sende Test-Bytes...")
+        sock.sendall(b'\xff\x00\x00\x00' + b'\x00' * 16)
+        try:
+            sock.settimeout(3)
+            data = sock.recv(512)
+            if data:
+                print(f"  Kamera antwortet mit {len(data)} Bytes:")
+                print(f"    Hex: {data[:40].hex()}")
+                print(f"    Raw: {data[:60]!r}")
+            else:
+                print("  Keine Antwort auf Test-Bytes")
+        except socket.timeout:
+            print("  Timeout — keine Antwort auf Test-Bytes")
+
+        sock.close()
+    except Exception as e:
+        print(f"  ✗ Fehler: {e}")
+
+
 def test_login():
-    """Test 2: Login über XM-Protokoll."""
+    """Test 2: Login über XM-Protokoll — versucht mehrere Varianten."""
     print()
     print("=" * 60)
     print("Test 2: XM-Protokoll Login")
     print("=" * 60)
 
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        sock.connect((CAMERA_IP, XM_PORT))
-        print(f"  ✓ TCP-Verbindung hergestellt")
+    hashed_pw = xm_hash_password(PASSWORD)
 
-        # Login-Request bauen
-        hashed_pw = xm_hash_password(PASSWORD)
-        login_data = json.dumps({
+    # Verschiedene Login-Varianten, da XM-Firmware-Versionen sich unterscheiden
+    login_variants = [
+        ("DVRIP-Web / MD5", {
             "EncryptType": "MD5",
             "LoginType": "DVRIP-Web",
             "PassWord": hashed_pw,
             "UserName": USERNAME
-        }).encode('utf-8') + b'\x0a'
+        }),
+        ("DVRIP-Web / Plain", {
+            "EncryptType": "MD5",
+            "LoginType": "DVRIP-Web",
+            "PassWord": PASSWORD if PASSWORD else "",
+            "UserName": USERNAME
+        }),
+        ("DVRIP-DVR / MD5", {
+            "EncryptType": "MD5",
+            "LoginType": "DVRIP-DVR",
+            "PassWord": hashed_pw,
+            "UserName": USERNAME
+        }),
+        ("Ohne LoginType", {
+            "EncryptType": "MD5",
+            "PassWord": hashed_pw,
+            "UserName": USERNAME
+        }),
+        ("Nur User+Pass", {
+            "UserName": USERNAME,
+            "PassWord": hashed_pw
+        }),
+    ]
 
-        packet = build_xm_packet(LOGIN_REQ, 0, login_data)
-        sock.sendall(packet)
-        print(f"  → Login-Request gesendet (User: {USERNAME})")
+    for variant_name, login_payload in login_variants:
+        print(f"\n  Versuch: {variant_name}")
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((CAMERA_IP, XM_PORT))
 
-        # Antwort empfangen
-        msg_id, session_id, result = parse_xm_response(sock)
+            login_data = json.dumps(login_payload).encode('utf-8') + b'\x0a'
+            packet = build_xm_packet(LOGIN_REQ, 0, login_data)
 
-        if msg_id is None:
-            print(f"  ✗ Keine Antwort: {result}")
-            sock.close()
-            return None
+            # Debug: Paket-Info
+            print(f"    Paket: {len(packet)} Bytes (Header: 20 + Daten: {len(login_data)})")
+            print(f"    Header hex: {packet[:20].hex()}")
 
-        print(f"  ← Antwort: MsgID={msg_id}, SessionID={session_id:#x}")
+            sock.sendall(packet)
 
-        if isinstance(result, dict):
-            ret = result.get("Ret", -1)
-            if ret == 100:
-                print(f"  ✓ LOGIN ERFOLGREICH!")
-                print(f"    Session-ID: {session_id:#010x}")
-                alvl = result.get("AuthorityList", [])
-                if alvl:
-                    print(f"    Berechtigungen: {alvl}")
-                return sock, session_id
+            # Antwort empfangen
+            msg_id, session_id, result = parse_xm_response(sock, timeout=5)
+
+            if msg_id is None:
+                print(f"    ✗ Keine Antwort: {result}")
+
+                # Debug: Lese rohe Bytes falls vorhanden
+                try:
+                    sock.settimeout(1)
+                    raw = sock.recv(256)
+                    if raw:
+                        print(f"    Debug: Rohe Bytes empfangen: {raw[:40].hex()}")
+                        print(f"    Debug: Als Text: {raw[:80]!r}")
+                except socket.timeout:
+                    pass
+
+                sock.close()
+                continue
+
+            print(f"    ← MsgID={msg_id}, SessionID={session_id:#010x}")
+
+            if isinstance(result, dict):
+                ret = result.get("Ret", -1)
+                print(f"    Ret={ret}")
+                if ret == 100:
+                    print(f"    ✓ LOGIN ERFOLGREICH mit '{variant_name}'!")
+                    session = result.get("SessionID", session_id)
+                    if isinstance(session, str):
+                        session = int(session, 16) if session.startswith("0x") else int(session)
+                    print(f"    Session-ID: {session:#010x}")
+                    return sock, session
+                else:
+                    print(f"    Antwort: {json.dumps(result, indent=2)[:200]}")
             else:
-                print(f"  ✗ Login fehlgeschlagen: Ret={ret}")
-                print(f"    Antwort: {json.dumps(result, indent=2)[:300]}")
-        else:
-            print(f"  ? Unerwartete Antwort: {result}")
+                print(f"    Antwort: {str(result)[:200]}")
 
-        sock.close()
-        return None
+            sock.close()
 
-    except Exception as e:
-        print(f"  ✗ Fehler: {e}")
-        return None
+        except Exception as e:
+            print(f"    ✗ Fehler: {e}")
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    print(f"\n  ✗ Alle Login-Varianten fehlgeschlagen")
+    return None
 
 
 def test_ptz_command(sock, session_id):
@@ -401,12 +510,16 @@ if __name__ == "__main__":
 
         exit(1)
 
+    # Test 1b: Raw-Probe
+    test_raw_probe()
+
     # Test 2: Login
     login_result = test_login()
     if login_result is None:
         print()
-        print("Login fehlgeschlagen. XM-Protokoll möglicherweise")
-        print("nicht kompatibel oder Zugangsdaten falsch.")
+        print("Login fehlgeschlagen.")
+        print("Bitte teile die Debug-Ausgabe oben — insbesondere die")
+        print("Hex-Dumps und Header-Informationen helfen bei der Analyse.")
         exit(1)
 
     sock, session_id = login_result
