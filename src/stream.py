@@ -1,30 +1,31 @@
 """
 Live-Vorschau (RTSP, Low-Latency via mpv).
 
-RPi 4 Besonderheiten:
-  - Vulkan (default gpu VO) → VK_ERROR_OUT_OF_HOST_MEMORY bei 4K
-    → --gpu-api=opengl erzwingen
-  - 4K HEVC zu schwer für RPi4 GPU → --vf=scale herunterskalieren
-  - drm_prime mapping kaputt → --hwdec=auto-copy (Frames→RAM)
+Kein Encoding, kein Skalieren — reiner Passthrough.
+RPi 4: --hwdec=auto-copy + --gpu-api=opengl (Vulkan hat OOM bei 4K).
 """
 
 import subprocess
 import sys
 
 import src.state as state
-from config.config import RTSP_SUB, RTSP_MAIN
+from config.config import CAMERA_IP, USERNAME, PASSWORD, RTSP_MAIN
 
-# Verschiedene Sub-Stream URLs die Xiongmai/XM-Kameras nutzen können
+# Alle bekannten Sub-Stream URLs für XM/Xiongmai-Kameras
+# (probe_streams.py kann die richtige ermitteln)
+_AUTH = f"{USERNAME}:{PASSWORD}@" if PASSWORD else f"{USERNAME}@"
 _SUB_STREAM_URLS = [
-    RTSP_SUB,                                               # /stream2
-    RTSP_SUB.replace('/stream2', '/cam/realmonitor?channel=1&subtype=1'),
-    RTSP_SUB.replace('/stream2', '/h264/ch1/sub/av_stream'),
+    f"rtsp://{_AUTH}{CAMERA_IP}:554/stream2",
+    # XM SDP-Stil: stream=1 = Sub-Stream
+    f"rtsp://{_AUTH}{CAMERA_IP}:554/user={USERNAME}&password={PASSWORD}&channel=1&stream=1.sdp",
+    # XM numerisch: 12 = Kanal 1, Stream 2 (sub)
+    f"rtsp://{_AUTH}{CAMERA_IP}:554/12",
 ]
 
 
-def _build_cmd(url, scale_down=False):
-    """mpv-Kommando mit Low-Latency-Einstellungen für Live-RTSP."""
-    cmd = [
+def _build_cmd(url):
+    """mpv-Kommando: reiner Passthrough, KEIN Re-Encoding/Skalieren."""
+    return [
         'mpv',
         '--fullscreen',
         '--no-audio',
@@ -42,37 +43,33 @@ def _build_cmd(url, scale_down=False):
         '--video-latency-hacks=yes',
         '--vd-lavc-threads=4',
         '--hwdec=auto-copy',
-        # OpenGL statt Vulkan — Vulkan hat auf RPi4 OOM bei 4K
         '--gpu-api=opengl',
         '--force-seekable=no',
         '--framedrop=decoder+vo',
         '--title=PTZ Live',
+        url,
     ]
-    # 4K → 960p skalieren damit RPi4 GPU es schafft
-    if scale_down:
-        cmd.append('--vf=lavfi=[scale=960:-2]')
-    cmd.append(url)
-    return cmd
 
 
 def show():
     """
-    Versucht Sub-Stream URLs, fällt auf Main-Stream (skaliert) zurück.
-    stderr wird durchgereicht damit mpv-Fehler sichtbar bleiben.
+    Probiert Sub-Stream URLs, fällt auf Main-Stream zurück.
+    Kein Skalieren / kein Re-Encoding — reiner Passthrough.
     """
-    # Sub-Stream versuchen (niedrigere Auflösung → kein Scale nötig)
+    # Sub-Stream versuchen (niedrigere Auflösung → RPi4 schafft es locker)
     for i, url in enumerate(_SUB_STREAM_URLS):
         label = f"Sub-Stream URL {i+1}/{len(_SUB_STREAM_URLS)}"
         print(f"Versuche {label}: {url}")
-        cmd = _build_cmd(url, scale_down=False)
+        cmd = _build_cmd(url)
         state.stream_proc = subprocess.Popen(cmd, stderr=sys.stderr)
         retcode = state.stream_proc.wait()
         if retcode == 0:
             return   # Benutzer hat Fenster geschlossen → sauber beenden
         print(f"  → {label} fehlgeschlagen (exit {retcode})")
 
-    # Fallback: Main-Stream mit Downscale (4K→960p, sonst OOM auf RPi4)
-    print(f"Alle Sub-Streams fehlgeschlagen, versuche Main-Stream (skaliert): {RTSP_MAIN}")
-    cmd = _build_cmd(RTSP_MAIN, scale_down=True)
+    # Fallback: Main-Stream (4K HEVC — ohne Filter, RPi4 muss es schaffen)
+    print(f"Kein Sub-Stream verfügbar → Main-Stream: {RTSP_MAIN}")
+    print("  TIPP: probe_streams.py auf dem Pi ausführen um die richtige URL zu finden!")
+    cmd = _build_cmd(RTSP_MAIN)
     state.stream_proc = subprocess.Popen(cmd, stderr=sys.stderr)
     state.stream_proc.wait()
