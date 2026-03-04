@@ -320,22 +320,29 @@ def disable_ai_tracking(sock=None, session_id=None):
 def ensure_ai_disabled():
     """
     Prüft ob AI aktiv ist und deaktiviert sie sofort falls ja.
-    Nutzt eine einzige TCP-Verbindung für Check + Disable.
-    Gibt (war_aktiv, anzahl_deaktiviert) zurück.
+    Nutzt eine einzige TCP-Verbindung für Check + Disable + Verify.
+    Gibt (war_aktiv, count, noch_aktiv, details) zurück.
+    war_aktiv=None bedeutet Verbindungsfehler.
     """
     sock, session_id = _xm_connect_and_login()
     if sock is None:
-        return None, 0
+        return None, 0, None, []
 
     try:
         is_active, details = check_ai_tracking_active(sock, session_id)
 
-        if is_active is None or not is_active:
-            return is_active or False, 0
+        if is_active is None:
+            return None, 0, None, []
+        if not is_active:
+            return False, 0, False, []
 
         # AI ist aktiv! Sofort deaktivieren (gleiche Verbindung)
         count = disable_ai_tracking(sock, session_id)
-        return True, count
+
+        # Direkt verifizieren (gleiche Verbindung!)
+        time.sleep(0.5)
+        still_active, still_details = check_ai_tracking_active(sock, session_id)
+        return True, count, still_active, still_details
     finally:
         sock.close()
 
@@ -435,7 +442,7 @@ def start_recording():
         '-i', RTSP_MAIN,              # Main-Stream für volle Qualität
         '-c:v', 'copy',               # Kein Re-Encoding → keine CPU-Last
         '-c:a', 'aac',                # Audio konvertieren (pcm_alaw → aac)
-        '-movflags', '+faststart',    # Schnelleres Abspielen nach Aufnahme
+        '-movflags', 'frag_keyframe+empty_moov',  # Fragmentierte MP4: crash-sicher!
         '-y', filepath
     ]
     ffmpeg_proc = subprocess.Popen(
@@ -598,29 +605,65 @@ def show_overlay():
     root.mainloop()
 
 # ============================================================
-# PTZ-Steuerung — nur bei Änderung senden!
+# PTZ-Steuerung — mit Auto-Reconnect
 # ============================================================
 # Request-Objekte einmal erstellen und wiederverwenden
 # (sonst wird bei JEDEM Joystick-Move ein neues SOAP-Objekt gebaut)
 _ptz_move_req = ptz_service.create_type('ContinuousMove')
 _ptz_move_req.ProfileToken = profile.token
 _ptz_stop_req = {'ProfileToken': profile.token}
+_ptz_error_count = 0
+_PTZ_RECONNECT_AFTER = 3   # Nach 3 aufeinanderfolgenden Fehlern → Reconnect
+
+def _reconnect_onvif():
+    """ONVIF-Verbindung komplett neu aufbauen."""
+    global cam, media_service, ptz_service, profiles, profile
+    global _ptz_move_req, _ptz_stop_req
+    try:
+        print("  ↻ ONVIF Reconnect...")
+        cam = ONVIFCamera(CAMERA_IP, CAMERA_PORT, USERNAME, PASSWORD)
+        media_service = cam.create_media_service()
+        ptz_service   = cam.create_ptz_service()
+        profiles = media_service.GetProfiles()
+        profile  = profiles[0]
+        _ptz_move_req = ptz_service.create_type('ContinuousMove')
+        _ptz_move_req.ProfileToken = profile.token
+        _ptz_stop_req = {'ProfileToken': profile.token}
+        print("  ✓ ONVIF Reconnect erfolgreich")
+        return True
+    except Exception as e:
+        print(f"  ✗ ONVIF Reconnect fehlgeschlagen: {e}")
+        return False
 
 def send_continuous_move(pan, tilt, zoom_speed):
+    global _ptz_error_count
     try:
         _ptz_move_req.Velocity = {
             'PanTilt': {'x': float(pan), 'y': float(tilt)},
             'Zoom': {'x': float(zoom_speed)}
         }
         ptz_service.ContinuousMove(_ptz_move_req)
+        _ptz_error_count = 0
     except Exception as e:
-        print(f"PTZ ContinuousMove Fehler: {e}")
+        _ptz_error_count += 1
+        if _ptz_error_count == 1:
+            print(f"PTZ ContinuousMove Fehler: {e}")
+        if _ptz_error_count >= _PTZ_RECONNECT_AFTER:
+            _reconnect_onvif()
+            _ptz_error_count = 0
 
 def send_stop():
+    global _ptz_error_count
     try:
         ptz_service.Stop(_ptz_stop_req)
+        _ptz_error_count = 0
     except Exception as e:
-        print(f"PTZ Stop Fehler: {e}")
+        _ptz_error_count += 1
+        if _ptz_error_count == 1:
+            print(f"PTZ Stop Fehler: {e}")
+        if _ptz_error_count >= _PTZ_RECONNECT_AFTER:
+            _reconnect_onvif()
+            _ptz_error_count = 0
 
 # ============================================================
 # Steuerungs-Loop
@@ -640,70 +683,76 @@ def control_loop():
     change_threshold = 0.03   # Minimale Änderung bevor neuer Befehl gesendet wird
 
     while running:
-        # Joystick/Poti auslesen (0.0 .. 1.0 → normalisiert auf -1.0 .. 1.0)
-        raw_x = joy_x.value
-        raw_y = joy_y.value
-        raw_z = int(pot.value * 1023)
+        try:
+            # Joystick/Poti auslesen (0.0 .. 1.0 → normalisiert auf -1.0 .. 1.0)
+            raw_x = joy_x.value
+            raw_y = joy_y.value
+            raw_z = int(pot.value * 1023)
 
-        pan  = (raw_x * 2.0 - 1.0) * PAN_MAX
-        tilt = (raw_y * 2.0 - 1.0) * TILT_MAX
+            pan  = (raw_x * 2.0 - 1.0) * PAN_MAX
+            tilt = (raw_y * 2.0 - 1.0) * TILT_MAX
 
-        # Deadzone anwenden
-        if abs(pan) < DEADZONE:
-            pan = 0.0
-        if abs(tilt) < DEADZONE:
-            tilt = 0.0
+            # Deadzone anwenden
+            if abs(pan) < DEADZONE:
+                pan = 0.0
+            if abs(tilt) < DEADZONE:
+                tilt = 0.0
 
-        # Zoom aus Poti (Mittelstellung = kein Zoom)
-        zoom_speed = 0.0
-        if raw_z < ZOOM_DEADZONE_LO:
-            zoom_speed = -(ZOOM_DEADZONE_LO - raw_z) / ZOOM_DEADZONE_LO * ZOOM_MAX
-        elif raw_z > ZOOM_DEADZONE_HI:
-            zoom_speed = (raw_z - ZOOM_DEADZONE_HI) / (1023 - ZOOM_DEADZONE_HI) * ZOOM_MAX
+            # Zoom aus Poti (Mittelstellung = kein Zoom)
+            zoom_speed = 0.0
+            if raw_z < ZOOM_DEADZONE_LO:
+                zoom_speed = -(ZOOM_DEADZONE_LO - raw_z) / ZOOM_DEADZONE_LO * ZOOM_MAX
+            elif raw_z > ZOOM_DEADZONE_HI:
+                zoom_speed = (raw_z - ZOOM_DEADZONE_HI) / (1023 - ZOOM_DEADZONE_HI) * ZOOM_MAX
 
-        # Ist Bewegung aktiv?
-        is_moving = (pan != 0.0 or tilt != 0.0 or zoom_speed != 0.0)
+            # Ist Bewegung aktiv?
+            is_moving = (pan != 0.0 or tilt != 0.0 or zoom_speed != 0.0)
 
-        # Nur senden wenn sich etwas geändert hat
-        if is_moving:
-            value_changed = (
-                abs(pan - prev_pan) > change_threshold or
-                abs(tilt - prev_tilt) > change_threshold or
-                abs(zoom_speed - prev_zoom) > change_threshold
-            )
-            if not prev_moving or value_changed:
-                send_continuous_move(pan, tilt, zoom_speed)
-                prev_pan = pan
-                prev_tilt = tilt
-                prev_zoom = zoom_speed
-        elif prev_moving:
-            # War in Bewegung, jetzt Stillstand → einmal Stop senden
-            send_stop()
+            # Nur senden wenn sich etwas geändert hat
+            if is_moving:
+                value_changed = (
+                    abs(pan - prev_pan) > change_threshold or
+                    abs(tilt - prev_tilt) > change_threshold or
+                    abs(zoom_speed - prev_zoom) > change_threshold
+                )
+                if not prev_moving or value_changed:
+                    send_continuous_move(pan, tilt, zoom_speed)
+                    prev_pan = pan
+                    prev_tilt = tilt
+                    prev_zoom = zoom_speed
+            elif prev_moving:
+                # War in Bewegung, jetzt Stillstand → einmal Stop senden
+                send_stop()
 
-        prev_moving = is_moving
+            prev_moving = is_moving
 
-        # ---- Button-Logik (kurz = Screenshot, lang = Aufnahme) ----
-        btn_state = joy_btn.is_pressed
-        now = time.time()
+            # ---- Button-Logik (kurz = Screenshot, lang = Aufnahme) ----
+            btn_state = joy_btn.is_pressed
+            now = time.time()
 
-        if btn_state and not btn_last_state:
-            btn_press_time = now
-            btn_action_done = False
-        elif btn_state and btn_press_time is not None:
-            if not btn_action_done and now - btn_press_time > 3.0:
-                if not recording:
-                    start_recording()
-                else:
-                    stop_recording()
-                btn_action_done = True
-        elif not btn_state and btn_last_state:
-            if btn_press_time is not None and not btn_action_done:
-                if now - btn_press_time < 3.0:
-                    take_screenshot()
-            btn_press_time = None
-            btn_action_done = False
+            if btn_state and not btn_last_state:
+                btn_press_time = now
+                btn_action_done = False
+            elif btn_state and btn_press_time is not None:
+                if not btn_action_done and now - btn_press_time > 3.0:
+                    if not recording:
+                        start_recording()
+                    else:
+                        stop_recording()
+                    btn_action_done = True
+            elif not btn_state and btn_last_state:
+                if btn_press_time is not None and not btn_action_done:
+                    if now - btn_press_time < 3.0:
+                        take_screenshot()
+                btn_press_time = None
+                btn_action_done = False
 
-        btn_last_state = btn_state
+            btn_last_state = btn_state
+
+        except Exception as e:
+            # SPI-Fehler, ONVIF-Timeout etc. dürfen den Loop NICHT killen!
+            print(f"  ⚠ Control-Loop Fehler (weiter): {e}")
+
         time.sleep(LOOP_SLEEP)
 
 # ============================================================
@@ -728,7 +777,7 @@ signal.signal(signal.SIGTERM, cleanup)
 if __name__ == "__main__":
     # Beim Start: AI prüfen und deaktivieren
     print("Prüfe AI-Tracking Status...")
-    was_active, count = ensure_ai_disabled()
+    was_active, count, still_active, still_details = ensure_ai_disabled()
     if was_active is None:
         print("  ⚠ Konnte AI-Status nicht prüfen (Verbindungsfehler)")
         print("    → Versuche trotzdem blind zu deaktivieren...")
@@ -740,13 +789,13 @@ if __name__ == "__main__":
             print("    → Ggf. manuell über iCSee/XMEye App deaktivieren")
     elif was_active:
         print(f"  🚨 AI-Tracking war AKTIV → {count} Feature(s) deaktiviert")
-        # Verifizieren
-        still_active, details = check_ai_tracking_active()
         if still_active:
-            print(f"  ⚠ WARNUNG: AI immer noch aktiv: {', '.join(details)}")
+            print(f"  ⚠ WARNUNG: AI immer noch aktiv: {', '.join(still_details)}")
             ai_warning_active = True
-        else:
+        elif still_active is False:
             print(f"  ✓ AI-Tracking erfolgreich deaktiviert")
+        else:
+            print(f"  ⚠ Verifikation fehlgeschlagen, Status unklar")
     else:
         print(f"  ✓ AI-Tracking ist AUS — alles gut!")
 
