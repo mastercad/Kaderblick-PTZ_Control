@@ -1,0 +1,6 @@
+onvif_zeep
+opencv-python
+#RPi.GPIO
+gpiozero
+lgpio
+adafruit-circuitpython-mcp3xxx
