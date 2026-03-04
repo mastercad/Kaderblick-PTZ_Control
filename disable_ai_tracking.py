@@ -2,14 +2,15 @@
 """
 Diagnose & Deaktivierung des KI-Trackings der Hiseeu HD118-PZ
 ==============================================================
-Dieses Script versucht systematisch alle bekannten Wege, das
-automatische Personen-/Objekt-Tracking der Kamera zu deaktivieren.
+Kamera-Chip: Novatek NT98566 mit XM/Xiongmai-Firmware
+Protokoll:   XM JSON-RPC über HTTP POST (NICHT GET!)
+
+Die Kamera antwortet auf GET-Requests mit:
+  { "Ret":136, "Tip":"Not support GET method" }
+Alle Befehle müssen als POST mit JSON-Body gesendet werden.
 
 Nutzung:
     python3 disable_ai_tracking.py
-
-Falls keiner der automatischen Wege funktioniert, wird eine
-Anleitung für die manuelle Deaktivierung im Webinterface ausgegeben.
 """
 
 import sys
@@ -24,8 +25,67 @@ CAMERA_PORT = 8899
 USERNAME = 'admin'
 PASSWORD = ''
 
+CGI_URL = f"http://{CAMERA_IP}/cgi-bin/param.cgi"
+
 # ============================================================
-# 1. Kamera-Info über ONVIF abfragen
+# XM JSON-RPC Hilfsfunktionen
+# ============================================================
+def xm_post(cmd, payload=None, auth=None):
+    """
+    Sendet einen POST-Request an die XM-Kamera im JSON-RPC-Format.
+    Gibt (erfolg: bool, antwort: dict|str) zurück.
+    """
+    data = {"cmd": cmd}
+    if payload is not None:
+        data.update(payload)
+
+    try:
+        r = requests.post(CGI_URL, json=data, auth=auth, timeout=5)
+    except requests.exceptions.RequestException as e:
+        return False, f"Verbindungsfehler: {e}"
+
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}"
+
+    text = r.text.strip()
+
+    # Prüfe auf bekannte Fehlermeldungen
+    if "Not support" in text:
+        return False, f"Nicht unterstützt: {text[:100]}"
+
+    # Versuche JSON zu parsen
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        # Manche Antworten kommen als rohes Key=Value
+        return True, text[:200] if text else "(leere Antwort)"
+
+    # XM-Kameras nutzen "Ret" als Return-Code
+    # Ret 0 oder 100 = Erfolg, alles andere = Fehler
+    ret = result.get("Ret", None)
+    if ret is not None:
+        if ret in (0, 100):
+            return True, result
+        else:
+            tip = result.get("Tip", "")
+            return False, f"Ret={ret} Tip={tip}"
+
+    # Wenn kein "Ret"-Feld, dann ist es wahrscheinlich eine Daten-Antwort
+    return True, result
+
+
+def xm_get_config(cmd, auth=None):
+    """Liest eine Konfiguration per POST ab."""
+    return xm_post(cmd, auth=auth)
+
+
+def xm_set_config(cmd, params, auth=None):
+    """Setzt eine Konfiguration per POST."""
+    return xm_post(cmd, payload=params, auth=auth)
+
+
+# ============================================================
+# 1. Kamera-Info über ONVIF
 # ============================================================
 def get_camera_info():
     print("=" * 60)
@@ -44,6 +104,7 @@ def get_camera_info():
     except Exception as e:
         print(f"  ✗ ONVIF-Verbindung fehlgeschlagen: {e}")
         return None
+
 
 # ============================================================
 # 2. ONVIF Analytics erkunden
@@ -74,8 +135,9 @@ def explore_onvif_analytics(cam):
     except Exception as e:
         print(f"  ✗ Analytics-Service nicht verfügbar: {e}")
 
+
 # ============================================================
-# 3. ONVIF PTZ-Konfiguration prüfen
+# 3. PTZ-Konfiguration prüfen
 # ============================================================
 def explore_ptz_config(cam):
     print()
@@ -104,13 +166,11 @@ def explore_ptz_config(cam):
         except Exception as e:
             print(f"  Presets: {e}")
 
-        # Guard Tour / Auto-Patrol prüfen
         try:
             nodes = ptz.GetNodes()
             for node in nodes:
                 print(f"  PTZ-Node: {node.token}")
                 print(f"    Home: {getattr(node, 'HomeSupported', 'N/A')}")
-                # AuxiliaryCommands können Tracking-bezogen sein
                 aux = getattr(node, 'AuxiliaryCommands', None)
                 if aux:
                     print(f"    AuxiliaryCommands: {aux}")
@@ -120,179 +180,203 @@ def explore_ptz_config(cam):
     except Exception as e:
         print(f"  ✗ PTZ-Service Fehler: {e}")
 
+
 # ============================================================
-# 4. HTTP-CGI Endpunkte scannen
+# 4. XM JSON-RPC Konfigurationen auslesen (POST!)
 # ============================================================
-def scan_http_endpoints():
+def scan_xm_configs():
     print()
     print("=" * 60)
-    print("4. HTTP-CGI Endpunkte scannen")
+    print("4. XM-Kamera Konfigurationen auslesen (POST JSON-RPC)")
     print("=" * 60)
 
-    base = f"http://{CAMERA_IP}"
-    auth_methods = [
-        ("Ohne Auth", None),
-        ("Basic Auth", HTTPBasicAuth(USERNAME, PASSWORD)),
-        ("Digest Auth", HTTPDigestAuth(USERNAME, PASSWORD)),
-    ]
-
-    # Bekannte Endpoints für verschiedene Kamera-Chipsets
-    endpoints = {
-        "Gerätinfo": [
-            "/cgi-bin/param.cgi?cmd=getdeviceinfo",
-            "/cgi-bin/hi3510/param.cgi?cmd=getserverinfo",
-            "/cgi-bin/configManager.cgi?action=getConfig&name=General",
-            "/onvif/device_service",
+    # Bekannte GET-Befehle im XM-Protokoll (per POST gesendet!)
+    get_commands = {
+        "Geräte-Info": [
+            "getDeviceInfo",
+            "getServerInfo",
+            "getSystemInfo",
         ],
         "AI / Smart Detection": [
-            "/cgi-bin/param.cgi?cmd=getSmartAlarm",
-            "/cgi-bin/param.cgi?cmd=gethumanaliarmattr",
-            "/cgi-bin/hi3510/param.cgi?cmd=gethumanaliarmattr",
-            "/cgi-bin/configManager.cgi?action=getConfig&name=SmartDetect",
-            "/cgi-bin/configManager.cgi?action=getConfig&name=VideoAnalyseRule",
-            "/cgi-bin/configManager.cgi?action=getConfig&name=TrafficEvent",
+            "getSmartAlarm",
+            "getHumanDetection",
+            "getHumanAlarm",
+            "gethumanaliarmattr",
+            "getSmartDetectCfg",
+            "getAiDetectConfig",
+            "getIntelliTraceConfig",
         ],
-        "Auto-Tracking": [
-            "/cgi-bin/param.cgi?cmd=getAutoTrack",
-            "/cgi-bin/param.cgi?cmd=getPTZAutoTrack",
-            "/cgi-bin/param.cgi?cmd=getptztrack",
-            "/cgi-bin/hi3510/param.cgi?cmd=getptzautotrack",
-            "/cgi-bin/configManager.cgi?action=getConfig&name=PTZAutoTrack",
+        "Auto-Tracking / PTZ": [
+            "getAutoTrack",
+            "getPTZAutoTrack",
+            "getptztrack",
+            "getPTZTrackConfig",
+            "getGuardTour",
+            "getptzctrl",
         ],
-        "PTZ Patrol / Guard Tour": [
-            "/cgi-bin/param.cgi?cmd=getptzctrl",
-            "/cgi-bin/param.cgi?cmd=getGuardTour",
-            "/cgi-bin/hi3510/param.cgi?cmd=getptzctrl",
-        ],
-        "Alarme": [
-            "/cgi-bin/param.cgi?cmd=getMotionDetect",
-            "/cgi-bin/param.cgi?cmd=getalarmattr",
-            "/cgi-bin/hi3510/param.cgi?cmd=getalarmattr",
+        "Alarme / Motion": [
+            "getMotionDetect",
+            "getalarmattr",
+            "getAlarmConfig",
         ],
     }
 
-    # Finde erstmal die richtige Auth-Methode
-    working_auth = None
-    for auth_name, auth in auth_methods:
-        try:
-            r = requests.get(f"{base}/", auth=auth, timeout=3)
-            if r.status_code in (200, 401):
-                if r.status_code == 200:
-                    working_auth = (auth_name, auth)
-                    print(f"  Auth-Methode: {auth_name}")
-                    break
-        except Exception:
-            pass
+    found_configs = {}
 
-    if working_auth is None:
-        # Default zu Basic
-        working_auth = ("Basic Auth", HTTPBasicAuth(USERNAME, PASSWORD))
-        print(f"  Auth-Methode: Basic Auth (Fallback)")
-
-    auth_name, auth = working_auth
-
-    for category, urls in endpoints.items():
+    for category, cmds in get_commands.items():
         print(f"\n  --- {category} ---")
-        for url_path in urls:
-            try:
-                r = requests.get(f"{base}{url_path}", auth=auth, timeout=3)
-                status = "✓" if r.status_code == 200 else f"✗ ({r.status_code})"
-                print(f"  {status} {url_path}")
-                if r.status_code == 200 and r.text.strip():
-                    # Antwort anzeigen (gekürzt)
-                    text = r.text.strip()[:300]
-                    for line in text.split('\n'):
-                        print(f"       {line.strip()}")
-            except requests.exceptions.RequestException as e:
-                print(f"  ✗ {url_path} — Timeout/Fehler")
+        for cmd in cmds:
+            # Versuche ohne und mit Auth
+            for auth in [None, HTTPBasicAuth(USERNAME, PASSWORD),
+                         HTTPDigestAuth(USERNAME, PASSWORD)]:
+                ok, result = xm_get_config(cmd, auth=auth)
+                if ok:
+                    print(f"  ✓ {cmd}")
+                    if isinstance(result, dict):
+                        for k, v in result.items():
+                            if k not in ("Ret", "SessionID"):
+                                print(f"       {k}: {json.dumps(v, indent=2) if isinstance(v, (dict, list)) else v}")
+                                found_configs[cmd] = result
+                    else:
+                        print(f"       {result}")
+                        found_configs[cmd] = result
+                    break  # Auth gefunden, weiter zum nächsten Befehl
+                else:
+                    if "Nicht unterstützt" in str(result):
+                        # POST ging durch, aber Befehl nicht unterstützt
+                        continue
+                    if "Verbindungsfehler" in str(result):
+                        break  # Kamera nicht erreichbar
+            else:
+                # Kein Auth hat funktioniert oder Befehl nicht unterstützt
+                print(f"  ✗ {cmd} — {result}")
+
+    return found_configs
+
 
 # ============================================================
-# 5. Deaktivierungsversuche
+# 5. KI-Tracking deaktivieren (POST JSON-RPC!)
 # ============================================================
-def try_disable_tracking():
+def try_disable_tracking(found_configs):
     print()
     print("=" * 60)
-    print("5. KI-Tracking deaktivieren — Versuche")
+    print("5. KI-Tracking deaktivieren (POST JSON-RPC)")
     print("=" * 60)
 
-    base = f"http://{CAMERA_IP}"
-    auth = HTTPBasicAuth(USERNAME, PASSWORD)
+    # Alle Disable-Befehle mit verschiedenen Parameternamen,
+    # da XM-Firmware-Versionen unterschiedliche Namen nutzen
+    disable_commands = [
+        # --- Smart / AI / Humanoid Detection ---
+        ("Smart Alarm AUS", "setSmartAlarm", {
+            "SmartAlarm": {"Enable": False, "HumanoidEnable": False,
+                           "SmdEnable": False, "AiEnable": False}
+        }),
+        ("Smart Alarm (flat)", "setSmartAlarm", {
+            "smd_enable": 0, "humanoid_enable": 0, "ai_enable": 0
+        }),
+        ("Human Detection AUS", "setHumanDetection", {
+            "HumanDetection": {"Enable": False}
+        }),
+        ("Human Alarm AUS", "setHumanAlarm", {
+            "HumanAlarm": {"Enable": False}
+        }),
+        ("Humanoid Alarm AUS", "sethumanaliarmattr", {
+            "enable": 0
+        }),
+        ("Smart Detect Config AUS", "setSmartDetectCfg", {
+            "SmartDetectCfg": {"Enable": False, "ObjectTypes": []}
+        }),
+        ("AI Detect AUS", "setAiDetectConfig", {
+            "AiDetectConfig": {"Enable": False}
+        }),
 
-    disable_cmds = [
-        # Smart / AI Detection
-        ("Smart Detection AUS",
-         f"{base}/cgi-bin/param.cgi?cmd=setSmartAlarm&-smd_enable=0&-humanoid_enable=0"),
-        ("AI Enable AUS",
-         f"{base}/cgi-bin/param.cgi?cmd=setSmartAlarm&-ai_enable=0"),
-        ("Humanoid Detection AUS",
-         f"{base}/cgi-bin/hi3510/param.cgi?cmd=sethumanaliarmattr&-enable=0"),
-        # Auto-Tracking
-        ("Auto-Track AUS (param)",
-         f"{base}/cgi-bin/param.cgi?cmd=setAutoTrack&-enable=0"),
-        ("PTZ Auto-Track AUS",
-         f"{base}/cgi-bin/param.cgi?cmd=setPTZAutoTrack&-enable=0"),
-        ("PTZ Track AUS (hi3510)",
-         f"{base}/cgi-bin/hi3510/param.cgi?cmd=setptzautotrack&-enable=0"),
-        # Config Manager Style
-        ("SmartDetect AUS (configManager)",
-         f"{base}/cgi-bin/configManager.cgi?action=setConfig&SmartDetect.Enable=false"),
-        ("VideoAnalyse AUS (configManager)",
-         f"{base}/cgi-bin/configManager.cgi?action=setConfig&VideoAnalyseRule[0].Enable=false"),
-        ("PTZAutoTrack AUS (configManager)",
-         f"{base}/cgi-bin/configManager.cgi?action=setConfig&PTZAutoTrack.Enable=false"),
+        # --- Auto-Tracking / PTZ Tracking ---
+        ("Auto-Track AUS", "setAutoTrack", {
+            "AutoTrack": {"Enable": False}
+        }),
+        ("Auto-Track (flat)", "setAutoTrack", {
+            "enable": 0
+        }),
+        ("PTZ Auto-Track AUS", "setPTZAutoTrack", {
+            "PTZAutoTrack": {"Enable": False}
+        }),
+        ("PTZ Track Config AUS", "setPTZTrackConfig", {
+            "PTZTrackConfig": {"Enable": False}
+        }),
+        ("PTZ Track (flat)", "setptztrack", {
+            "enable": 0
+        }),
+        ("Intelli-Trace AUS", "setIntelliTraceConfig", {
+            "IntelliTraceConfig": {"Enable": False}
+        }),
+
+        # --- Guard Tour / Patrol ---
+        ("Guard Tour AUS", "setGuardTour", {
+            "GuardTour": {"Enable": False}
+        }),
     ]
 
     success = []
-    for name, url in disable_cmds:
-        for auth_attempt in [HTTPBasicAuth(USERNAME, PASSWORD), HTTPDigestAuth(USERNAME, PASSWORD), None]:
-            try:
-                r = requests.get(url, auth=auth_attempt, timeout=3)
-                if r.status_code == 200 and 'error' not in r.text.lower():
-                    print(f"  ✓ {name}")
-                    if r.text.strip():
-                        print(f"       Antwort: {r.text.strip()[:100]}")
-                    success.append(name)
-                    break
-                else:
-                    pass
-            except Exception:
-                pass
-        else:
-            print(f"  ✗ {name}")
+    failed = []
 
-    return success
+    for name, cmd, params in disable_commands:
+        # Versuche ohne und mit Auth
+        best_result = None
+        for auth in [None, HTTPBasicAuth(USERNAME, PASSWORD),
+                     HTTPDigestAuth(USERNAME, PASSWORD)]:
+            ok, result = xm_set_config(cmd, params, auth=auth)
+            if ok:
+                print(f"  ✓ {name}")
+                if isinstance(result, dict):
+                    print(f"       Antwort: {json.dumps(result)[:120]}")
+                else:
+                    print(f"       Antwort: {str(result)[:120]}")
+                success.append(name)
+                break
+            best_result = result
+        else:
+            # Nur als Fehler zeigen wenn mindestens einer es versucht hat
+            print(f"  ✗ {name} — {best_result}")
+            failed.append(name)
+
+    return success, failed
+
 
 # ============================================================
-# 6. Zusammenfassung
+# 6. Zusammenfassung & manuelle Anleitung
 # ============================================================
 def print_manual_instructions():
-    print()
-    print("=" * 60)
-    print("MANUELLE DEAKTIVIERUNG (falls automatisch nicht möglich)")
-    print("=" * 60)
     print(f"""
-  1. Öffne im Browser: http://{CAMERA_IP}
-     Login: {USERNAME} / {'(kein Passwort)' if not PASSWORD else PASSWORD}
+  ╔══════════════════════════════════════════════════════════╗
+  ║  MANUELLE DEAKTIVIERUNG                                 ║
+  ║  (falls automatisch nicht möglich)                      ║
+  ╚══════════════════════════════════════════════════════════╝
 
-  2. Suche in den Einstellungen nach:
-     • "Smart Detection" / "Intelligente Erkennung" → AUS
-     • "Auto Tracking" / "Automatische Verfolgung" → AUS
-     • "Human Detection" / "Personenerkennung" → AUS
-     • "Motion Tracking" / "Bewegungsverfolgung" → AUS
-     • "Guard Tour" / "Patrouille" → AUS
+  Die Kamera (XM/Xiongmai NT98566) hat proprietäre AI-Features,
+  die sich möglicherweise NUR über die Hersteller-App deaktivieren
+  lassen.
 
-  3. Unter "PTZ" Einstellungen:
-     • "Auto Patrol" / "Automatische Patrouille" → AUS
-     • "Idle Action" / "Leerlauf-Aktion" → NONE / KEINE
+  Option 1 — Handy-App (wahrscheinlichste Lösung):
+    • Installiere "iCSee" oder "XMEye" auf dem Handy
+    • Kamera hinzufügen: {CAMERA_IP}
+    • Einstellungen → Smart/AI Detection → ALLES AUS
+    • Einstellungen → Tracking/Verfolgung → AUS
 
-  4. Falls die Kamera eine Handy-App nutzt (z.B. CamHi/iCSee/XMEye):
-     • App öffnen → Geräteeinstellungen → AI/Smart → Alles AUS
-     • Oft lässt sich Tracking NUR über die App deaktivieren!
+  Option 2 — Webinterface:
+    • Öffne http://{CAMERA_IP} im Browser
+    • Login: {USERNAME} / {'(kein Passwort)' if not PASSWORD else PASSWORD}
+    • Suche nach: Smart Detection / Auto Tracking / Human → AUS
 
-  5. Alternativ: Kamera auf Werkseinstellungen zurücksetzen
-     (Reset-Knopf 10 Sek drücken) und dann NUR über ONVIF
-     steuern, ohne die Hersteller-App einzurichten.
+  Option 3 — Werksreset:
+    • Reset-Knopf an der Kamera 10 Sek gedrückt halten
+    • Kamera NUR über ONVIF einrichten (nicht über App)
+    • So werden keine AI-Features aktiviert
+
+  Option 4 — Netzwerk-Isolation:
+    • Kamera vom Internet trennen (nur lokales Netz)
+    • Manche AI-Features brauchen Cloud-Verbindung
 """)
+
 
 # ============================================================
 # Main
@@ -304,17 +388,22 @@ if __name__ == "__main__":
         explore_onvif_analytics(cam)
         explore_ptz_config(cam)
 
-    scan_http_endpoints()
-    successes = try_disable_tracking()
+    found = scan_xm_configs()
+    success, failed = try_disable_tracking(found)
 
-    if successes:
-        print()
+    print()
+    print("=" * 60)
+    if success:
+        print(f"ERGEBNIS: {len(success)} Deaktivierung(en) tatsächlich erfolgreich")
         print("=" * 60)
-        print(f"ERGEBNIS: {len(successes)} Deaktivierung(en) erfolgreich!")
-        print("=" * 60)
-        for s in successes:
+        for s in success:
             print(f"  ✓ {s}")
+        if failed:
+            print(f"\n  ({len(failed)} Befehle nicht unterstützt — ist normal,")
+            print(f"   verschiedene Firmware-Versionen nutzen verschiedene Namen)")
     else:
+        print("ERGEBNIS: Kein automatischer Deaktivierungs-Befehl war erfolgreich")
+        print("=" * 60)
         print_manual_instructions()
 
     print()

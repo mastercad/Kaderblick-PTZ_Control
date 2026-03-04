@@ -19,12 +19,12 @@ Latenz-Optimierungen:
 
 import time
 import os
+import json
 import subprocess
 import threading
 import signal
 import sys
 import requests
-from requests.auth import HTTPDigestAuth
 from onvif import ONVIFCamera
 from gpiozero import MCP3008, Button
 import tkinter as tk
@@ -84,66 +84,67 @@ profile  = profiles[0]
 print(f"Verbunden. Profil: {profile.Name}")
 
 # ============================================================
-# KI-Tracking deaktivieren
+# KI-Tracking deaktivieren (XM JSON-RPC, POST!)
 # ============================================================
 def disable_ai_tracking():
     """
-    Versucht das integrierte KI-Tracking/Auto-Tracking der Kamera
-    über verschiedene Wege zu deaktivieren:
-    1. HTTP-CGI-Befehle (typisch für Hiseeu/HiSilicon-Kameras)
-    2. ONVIF-Analytics
+    Versucht das KI-Tracking der XM/Xiongmai-Kamera zu deaktivieren.
+    Nutzt POST mit JSON-Body (nicht GET — GET gibt nur "Not support GET method").
     """
     print("Versuche KI-Tracking zu deaktivieren...")
-    auth = HTTPDigestAuth(USERNAME, PASSWORD) if PASSWORD else None
-    base = f"http://{CAMERA_IP}"
+    cgi_url = f"http://{CAMERA_IP}/cgi-bin/param.cgi"
 
-    # Verschiedene CGI-Endpunkte die bei Hiseeu-Kameras funktionieren können
-    cgi_attempts = [
-        # Humanoid / Smart-Detection deaktivieren
-        f"{base}/cgi-bin/param.cgi?cmd=setSmartAlarm&-smd_enable=0&-humanoid_enable=0",
-        f"{base}/cgi-bin/param.cgi?cmd=setSmartAlarm&-ai_enable=0",
-        # Auto-Tracking deaktivieren
-        f"{base}/cgi-bin/param.cgi?cmd=setAutoTrack&-enable=0",
-        f"{base}/cgi-bin/param.cgi?cmd=setPTZAutoTrack&-enable=0",
-        # Alternativer Pfad
-        f"{base}/cgi-bin/configManager.cgi?action=setConfig&SmartDetect.Enable=false",
-        f"{base}/cgi-bin/configManager.cgi?action=setConfig&VideoAnalyseRule[0].Enable=false",
-        # XM/Hiseeu spezifisch
-        f"{base}/cgi-bin/hi3510/param.cgi?cmd=sethumanaliarmattr&-enable=0",
+    # Befehle mit verschiedenen Parameternamen für verschiedene FW-Versionen
+    disable_commands = [
+        ("Smart Alarm", "setSmartAlarm", {
+            "SmartAlarm": {"Enable": False, "HumanoidEnable": False,
+                           "SmdEnable": False, "AiEnable": False}
+        }),
+        ("Human Detection", "setHumanDetection", {
+            "HumanDetection": {"Enable": False}
+        }),
+        ("Auto-Track", "setAutoTrack", {
+            "AutoTrack": {"Enable": False}
+        }),
+        ("PTZ Auto-Track", "setPTZAutoTrack", {
+            "PTZAutoTrack": {"Enable": False}
+        }),
+        ("Intelli-Trace", "setIntelliTraceConfig", {
+            "IntelliTraceConfig": {"Enable": False}
+        }),
+        ("Guard Tour", "setGuardTour", {
+            "GuardTour": {"Enable": False}
+        }),
     ]
 
-    success = False
-    for url in cgi_attempts:
+    success_count = 0
+    for name, cmd, params in disable_commands:
+        data = {"cmd": cmd}
+        data.update(params)
         try:
-            r = requests.get(url, auth=auth, timeout=3)
-            if r.status_code == 200 and 'error' not in r.text.lower():
-                print(f"  ✓ Erfolgreich: {url.split('?')[1][:50]}")
-                success = True
+            r = requests.post(cgi_url, json=data, timeout=3)
+            if r.status_code == 200:
+                text = r.text.strip()
+                # Prüfe ob es WIRKLICH Erfolg war
+                if "Not support" in text:
+                    continue  # Befehl nicht unterstützt, kein Fehler
+                try:
+                    result = json.loads(text)
+                    ret = result.get("Ret", -1)
+                    if ret in (0, 100):
+                        print(f"  ✓ {name} deaktiviert")
+                        success_count += 1
+                except json.JSONDecodeError:
+                    pass
         except requests.exceptions.RequestException:
             pass
 
-    # ONVIF Analytics versuchen
-    try:
-        analytics = cam.create_analytics_service()
-        configs = analytics.GetAnalyticsEngineConfigs()
-        for config in configs:
-            try:
-                # Versuche alle Analytics-Rules zu deaktivieren
-                analytics.DeleteRules({'ConfigurationToken': config.token})
-                print(f"  ✓ ONVIF Analytics-Rules gelöscht für {config.token}")
-                success = True
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    if not success:
-        print("  ⚠ KI-Tracking konnte nicht automatisch deaktiviert werden.")
-        print("    → Bitte manuell im Kamera-Webinterface deaktivieren:")
-        print(f"    → http://{CAMERA_IP}")
-        print("    → Unter: Einstellungen → Smart/AI → Tracking → AUS")
+    if success_count > 0:
+        print(f"  {success_count} Feature(s) deaktiviert.")
     else:
-        print("  KI-Tracking deaktiviert.")
+        print("  ⚠ Kein Befehl war erfolgreich.")
+        print("    → Deaktiviere Tracking manuell über iCSee/XMEye App")
+        print("    → oder starte: python3 disable_ai_tracking.py")
 
 # ============================================================
 # Aufnahme (Main-Stream in voller Qualität)
