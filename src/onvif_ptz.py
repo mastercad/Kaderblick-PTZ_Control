@@ -1,5 +1,5 @@
 """
-ONVIF PTZ-Steuerung mit Auto-Reconnect.
+ONVIF PTZ-Steuerung mit Auto-Reconnect + Stream-URI-Erkennung.
 """
 
 from onvif import ONVIFCamera
@@ -15,6 +15,46 @@ _stop_req = None
 _error_count = 0
 _RECONNECT_AFTER = 3
 
+# Erkannte Stream-URIs (von init() gefüllt)
+stream_uris = {}   # {"mainStream": "rtsp://...", "subStream": "rtsp://...", ...}
+
+
+def _discover_stream_uris():
+    """Alle ONVIF-Profile durchgehen und deren RTSP-URIs ermitteln."""
+    global stream_uris
+    stream_uris = {}
+    try:
+        profiles = media_service.GetProfiles()
+        print(f"  ONVIF-Profile gefunden: {len(profiles)}")
+        for p in profiles:
+            try:
+                stream_setup = {
+                    'Stream': 'RTP-Unicast',
+                    'Transport': {'Protocol': 'RTSP'}
+                }
+                uri_resp = media_service.GetStreamUri({
+                    'StreamSetup': stream_setup,
+                    'ProfileToken': p.token,
+                })
+                uri = uri_resp.Uri if hasattr(uri_resp, 'Uri') else str(uri_resp)
+                stream_uris[p.Name] = uri
+                # Auflösung ermitteln falls möglich
+                res_info = ""
+                try:
+                    vec = p.VideoEncoderConfiguration
+                    if vec and hasattr(vec, 'Resolution'):
+                        w = vec.Resolution.Width
+                        h = vec.Resolution.Height
+                        enc = vec.Encoding if hasattr(vec, 'Encoding') else '?'
+                        res_info = f" ({w}x{h} {enc})"
+                except Exception:
+                    pass
+                print(f"    {p.Name}{res_info}: {uri}")
+            except Exception as e:
+                print(f"    {p.Name}: URI-Abfrage fehlgeschlagen ({e})")
+    except Exception as e:
+        print(f"  ⚠ Stream-URI-Erkennung fehlgeschlagen: {e}")
+
 
 def init():
     """Erstverbindung zur Kamera herstellen. Einmal beim Start aufrufen."""
@@ -29,6 +69,7 @@ def init():
     _move_req.ProfileToken = profile.token
     _stop_req = {'ProfileToken': profile.token}
     print(f"Verbunden. Profil: {profile.Name}")
+    _discover_stream_uris()
 
 
 def reconnect():

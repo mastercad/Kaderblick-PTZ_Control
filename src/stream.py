@@ -1,10 +1,9 @@
 """
 Live-Vorschau (Sub-Stream, Low-Latency via mpv).
 
-RPi 4 Besonderheit:
-  --hwdec=auto-safe wählt 'drm' → drm_prime Frames → gpu VO kann die
-  DRM-Modifier nicht mappen → blaues Bild + "mapping DRM dmabuf failed".
-  Lösung: --hwdec=auto-copy  (HW-Decode, aber Frames werden ins RAM kopiert).
+RPi 4:
+  --hwdec=auto-copy  → HW-Decode, Frames→RAM (kein DRM dmabuf nötig)
+  NICHT --untimed    → für Live-RTSP ungeeignet (friert ein!)
 """
 
 import subprocess
@@ -22,28 +21,26 @@ _SUB_STREAM_URLS = [
 
 
 def _build_cmd(url):
-    """mpv-Kommando mit Low-Latency-Einstellungen zusammenbauen."""
+    """mpv-Kommando mit Low-Latency-Einstellungen für Live-RTSP."""
     # WICHTIG: --demuxer-lavf-o darf nur EINMAL vorkommen (letzter gewinnt!)
     return [
         'mpv',
         '--fullscreen',
         '--no-audio',
         '--profile=low-latency',
-        '--untimed',
-        '--no-cache',
+        # KEIN --untimed! Das ist für Dateien, nicht Live-Streams.
+        # Bei RTSP friert es nach dem 1. Frame ein.
+        '--cache=no',
         '--cache-pause=no',
         '--demuxer-lavf-o='
-            'fflags=+nobuffer+fastseek,'
+            'fflags=+nobuffer+fastseek+discardcorrupt,'
             'rtsp_transport=tcp,'
-            'analyzeduration=500000,'   # 0.5 s reichen für Codec-Erkennung
-            'probesize=65536',          # 64 KB
-        '--demuxer-readahead-secs=0.2',
+            'analyzeduration=500000,'
+            'probesize=65536',
+        '--demuxer-readahead-secs=0.5',
         '--interpolation=no',
-        # Kein --video-sync bei --untimed + --no-audio (RTSP hat oft keine PTS)
         '--video-latency-hacks=yes',
         '--vd-lavc-threads=4',
-        # auto-copy: HW-Decode, aber Frames→RAM kopieren (vermeidet
-        # drm_prime/dmabuf-Fehler auf RPi 4)
         '--hwdec=auto-copy',
         '--force-seekable=no',
         '--framedrop=decoder+vo',

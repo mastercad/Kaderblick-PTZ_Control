@@ -14,6 +14,9 @@ from config.config import (
     LOOP_SLEEP,
 )
 
+# Rate-Limiting: mindestens so viele Sekunden zwischen ONVIF-Befehlen
+_MIN_CMD_INTERVAL = 0.10   # 100 ms → max ~10 Befehle/s
+
 
 def control_loop():
     """Hauptschleife: liest Hardware ein und steuert PTZ + Aufnahme."""
@@ -26,6 +29,9 @@ def control_loop():
     prev_tilt = 0.0
     prev_zoom = 0.0
     change_threshold = 0.03
+    last_cmd_time = 0.0
+    stop_retries = 0          # Zählt wiederholte Stop-Befehle
+    _STOP_RETRY_MAX = 3       # So oft Stop wiederholen nach Bewegungsende
 
     while state.running:
         try:
@@ -48,28 +54,37 @@ def control_loop():
             elif raw_z > ZOOM_DEADZONE_HI:
                 zoom_speed = (raw_z - ZOOM_DEADZONE_HI) / (1023 - ZOOM_DEADZONE_HI) * ZOOM_MAX
 
-            # ── PTZ nur bei Änderung senden ──────────────────
+            # ── PTZ mit Rate-Limiting senden ─────────────────
+            now = time.time()
             is_moving = (pan != 0.0 or tilt != 0.0 or zoom_speed != 0.0)
 
             if is_moving:
+                stop_retries = 0
                 value_changed = (
                     abs(pan - prev_pan) > change_threshold or
                     abs(tilt - prev_tilt) > change_threshold or
                     abs(zoom_speed - prev_zoom) > change_threshold
                 )
-                if not prev_moving or value_changed:
+                if (not prev_moving or value_changed) and \
+                   (now - last_cmd_time >= _MIN_CMD_INTERVAL):
                     ptz.continuous_move(pan, tilt, zoom_speed)
+                    last_cmd_time = now
                     prev_pan = pan
                     prev_tilt = tilt
                     prev_zoom = zoom_speed
-            elif prev_moving:
-                ptz.stop()
+            elif prev_moving or stop_retries > 0:
+                # Stop MEHRFACH senden damit kein Befehl verloren geht
+                if prev_moving:
+                    stop_retries = _STOP_RETRY_MAX
+                if stop_retries > 0 and (now - last_cmd_time >= _MIN_CMD_INTERVAL):
+                    ptz.stop()
+                    last_cmd_time = now
+                    stop_retries -= 1
 
             prev_moving = is_moving
 
             # ── Button (kurz=Screenshot, lang=Aufnahme) ──────
             btn_state = hw.joy_btn.is_pressed
-            now = time.time()
 
             if btn_state and not btn_last_state:
                 btn_press_time = now
