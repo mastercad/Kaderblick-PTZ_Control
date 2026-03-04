@@ -1,0 +1,51 @@
+Was die Profis tatsächlich machen (Veo, Pixellot, Spiideo):
+
+Die nutzen kein mechanisches PTZ. Stattdessen:
+
+Feste Weitwinkel-Kamera (180° oder 2 × 120°) in 4K/6K/8K, die das gesamte Spielfeld erfasst
+Software-Tracking per GPU/Cloud — trainierte Modelle erkennen Ball, Spieler, Linien
+Virtueller PTZ-Crop — aus dem 4K-Bild wird ein 1080p-Ausschnitt "ausgeschnitten" und dem Ball nachgeführt, rein digital, ohne Mechanik → instant, kein Schwenk-Delay
+Könnte man das mit dieser Kamera nachbauen?
+
+Theoretisch ja, eingeschränkt:
+
+4K-Stream aufnehmen (3840×2160, 17 FPS) — das gesamte Spielfeld im Bild
+In Post-Processing (z.B. auf PC mit Python + YOLO/OpenCV) Ball tracken
+1080p-Crop digital nachführen
+Aber: 17 FPS ist grenzwertig, und der Pi schafft die Echtzeit-Ball-Detection mit YOLO nicht. Das wäre nur als Nachbearbeitung realistisch, nicht live.
+
+Für echtes autonomes Live-Fußball-Tracking brauchst du:
+
+Eine Kamera mit ≥4K bei 30fps, Weitwinkel, die das ganze Feld sieht
+Einen PC/Laptop am Rand mit GPU (oder Cloud-Anbindung)
+Ball-Detection-Modell (z.B. YOLO trainiert auf Fußball)
+Software für den virtuellen Crop
+Oder schlicht: Veo Camera (~800€/Jahr Abo) — die machen genau das, schlüsselfertig.
+
+```
+warum sind 30FPS und mehr wichtig? warum reichen 15FPS nicht aus?
+
+Eine Veo Cam kostet allein schon 1.5k € Anschaffung und dann noch 1.500 bis 5.000€ im Jahr nichts mit 800€
+```
+
+Du hast recht, bei beidem muss ich mich korrigieren:
+
+FPS für Ball-Tracking — 15 FPS reichen tatsächlich:
+
+Rechnen wir nach:
+
+Harter Pass: ~80 km/h = ~22 m/s
+Spielfeldbreite ~100m, bei 4K (3840px): 1 Pixel ≈ 2,6cm
+Bei 15 FPS: Ball bewegt sich ~1,5m = ~56 Pixel zwischen Frames
+Bei 30 FPS: Ball bewegt sich ~0,7m = ~28 Pixel zwischen Frames
+56 Pixel Verschiebung pro Frame ist für moderne Tracker (SORT, ByteTrack) kein Problem — die arbeiten mit Prädiktionsmodellen und können deutlich größere Sprünge zuordnen. Das schwierigere Problem ist die Erkennung des Balls (nur ~10 Pixel Durchmesser bei 50m Entfernung), nicht die Framerate.
+
+17 FPS deiner Kamera wären für Tracking also grundsätzlich nutzbar. Meine Aussage "17 FPS ist grenzwertig" war übertrieben. Sorry.
+
+Was bei 15 FPS tatsächlich leidet, ist die Darstellungsqualität — das Ergebnisvideo ruckelt sichtbar. Aber das ist ein Viewing-Problem, kein Tracking-Problem.
+
+Veo-Preise — danke für die Korrektur:
+
+Du hast recht. Veo Cam 2: ~1.500€ Hardware + 1.500-5.000€/Jahr Abo. Das ist eine ganz andere Hausnummer als meine falsche Angabe. In Summe über 3 Jahre: 6.000–16.500€. Nichts, was ein Amateurverein mal eben ausgibt.
+
+Das relativiert auch die DIY-Lösung: Eure Kamera (50-80€?) + Pi (80€) + Joystick/Poti (10€) = ~170€ für manuelle Steuerung. Das ist ein komplett anderes Budget-Level.
