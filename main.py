@@ -161,27 +161,33 @@ def _xm_connect_and_login():
 
 def _xm_get_config(sock, session_id, config_name):
     """Liest eine Konfiguration. Gibt (erfolg, daten) zurück."""
-    payload = json.dumps({
-        "Name": config_name,
-        "SessionID": f"0x{session_id:08X}"
-    }).encode('utf-8') + b'\x0a'
-    sock.sendall(_xm_build_packet(1042, session_id, payload))
-    resp = _xm_recv_response(sock, timeout=2)
-    if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
-        return True, resp
-    return False, resp
+    try:
+        payload = json.dumps({
+            "Name": config_name,
+            "SessionID": f"0x{session_id:08X}"
+        }).encode('utf-8') + b'\x0a'
+        sock.sendall(_xm_build_packet(1042, session_id, payload))
+        resp = _xm_recv_response(sock, timeout=2)
+        if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
+            return True, resp
+        return False, resp
+    except (OSError, ConnectionError):
+        return False, None
 
 
 def _xm_set_config(sock, session_id, config_name, config_data):
     """Setzt eine Konfiguration. Gibt True/False zurück."""
-    payload = json.dumps({
-        "Name": config_name,
-        config_name: config_data,
-        "SessionID": f"0x{session_id:08X}"
-    }).encode('utf-8') + b'\x0a'
-    sock.sendall(_xm_build_packet(1040, session_id, payload))
-    resp = _xm_recv_response(sock, timeout=2)
-    return isinstance(resp, dict) and resp.get("Ret") in (0, 100)
+    try:
+        payload = json.dumps({
+            "Name": config_name,
+            config_name: config_data,
+            "SessionID": f"0x{session_id:08X}"
+        }).encode('utf-8') + b'\x0a'
+        sock.sendall(_xm_build_packet(1040, session_id, payload))
+        resp = _xm_recv_response(sock, timeout=2)
+        return isinstance(resp, dict) and resp.get("Ret") in (0, 100)
+    except (OSError, ConnectionError):
+        return False
 
 
 # ============================================================
@@ -777,7 +783,11 @@ signal.signal(signal.SIGTERM, cleanup)
 if __name__ == "__main__":
     # Beim Start: AI prüfen und deaktivieren
     print("Prüfe AI-Tracking Status...")
-    was_active, count, still_active, still_details = ensure_ai_disabled()
+    try:
+        was_active, count, still_active, still_details = ensure_ai_disabled()
+    except Exception as e:
+        print(f"  ⚠ Fehler bei AI-Prüfung: {e}")
+        was_active, count, still_active, still_details = None, 0, None, []
     if was_active is None:
         print("  ⚠ Konnte AI-Status nicht prüfen (Verbindungsfehler)")
         print("    → Versuche trotzdem blind zu deaktivieren...")
