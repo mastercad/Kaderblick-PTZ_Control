@@ -471,8 +471,14 @@ def test_latency_comparison(sock, session_id):
         print(f"    Min:          {onvif_min:6.1f} ms")
         print(f"    Max:          {onvif_max:6.1f} ms")
 
-        speedup = onvif_avg / xm_avg if xm_avg > 0 else 0
-        print(f"\n  → XM ist {speedup:.1f}x schneller als ONVIF!")
+        if xm_avg < onvif_avg:
+            speedup = onvif_avg / xm_avg
+            print(f"\n  → XM ist {speedup:.1f}x schneller als ONVIF")
+            print(f"  → Empfehlung: PTZ-Steuerung auf XM-Protokoll umstellen")
+        else:
+            speedup = xm_avg / onvif_avg
+            print(f"\n  → ONVIF ist {speedup:.1f}x schneller als XM")
+            print(f"  → Empfehlung: Bei ONVIF bleiben!")
 
     except Exception as e:
         print(f"\n  ONVIF-Vergleich nicht möglich: {e}")
@@ -537,6 +543,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("FAZIT")
     print("=" * 60)
-    print("Wenn die Tests erfolgreich waren, kann die PTZ-Steuerung")
-    print("in main.py auf das XM-Protokoll umgestellt werden.")
-    print("Das würde die Reaktionszeit drastisch verbessern.")
+    print("Das schnellere Protokoll sollte für PTZ genutzt werden.")
+    print("Falls ONVIF schneller ist → kein Wechsel nötig.")
+    print("Die Video-Latenz (Vorschau) ist unabhängig vom PTZ-Protokoll")
+    print("und wird durch Sub-Stream + mpv Low-Latency gelöst.")
