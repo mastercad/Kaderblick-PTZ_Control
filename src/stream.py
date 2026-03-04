@@ -2,25 +2,15 @@
 Live-Vorschau (RTSP, Low-Latency via mpv).
 
 Kein Encoding, kein Skalieren — reiner Passthrough.
-RPi 4: --hwdec=auto-copy + --gpu-api=opengl (Vulkan hat OOM bei 4K).
+Nutzt die von ONVIF erkannte Sub-Stream URL (640x360 H264).
 """
 
 import subprocess
 import sys
 
 import src.state as state
-from config.config import CAMERA_IP, USERNAME, PASSWORD, RTSP_MAIN
-
-# Alle bekannten Sub-Stream URLs für XM/Xiongmai-Kameras
-# (probe_streams.py kann die richtige ermitteln)
-_AUTH = f"{USERNAME}:{PASSWORD}@" if PASSWORD else f"{USERNAME}@"
-_SUB_STREAM_URLS = [
-    f"rtsp://{_AUTH}{CAMERA_IP}:554/stream2",
-    # XM SDP-Stil: stream=1 = Sub-Stream
-    f"rtsp://{_AUTH}{CAMERA_IP}:554/user={USERNAME}&password={PASSWORD}&channel=1&stream=1.sdp",
-    # XM numerisch: 12 = Kanal 1, Stream 2 (sub)
-    f"rtsp://{_AUTH}{CAMERA_IP}:554/12",
-]
+from src import onvif_ptz as ptz
+from config.config import RTSP_MAIN
 
 
 def _build_cmd(url):
@@ -42,7 +32,9 @@ def _build_cmd(url):
         '--interpolation=no',
         '--video-latency-hacks=yes',
         '--vd-lavc-threads=4',
-        '--hwdec=auto-copy',
+        # no: kein HW-Decode-Versuch → vermeidet VDPAU/CUDA/Vulkan-Warnungen
+        # RPi4 schafft 640x360 H264 locker in Software
+        '--hwdec=no',
         '--gpu-api=opengl',
         '--force-seekable=no',
         '--framedrop=decoder+vo',
@@ -51,25 +43,39 @@ def _build_cmd(url):
     ]
 
 
+def _get_sub_stream_url():
+    """
+    Holt die Sub-Stream URL aus der ONVIF-Erkennung.
+    Sucht nach 'subStream' in den erkannten Profilen.
+    """
+    for name, uri in ptz.stream_uris.items():
+        if 'sub' in name.lower():
+            return uri
+    return None
+
+
 def show():
     """
-    Probiert Sub-Stream URLs, fällt auf Main-Stream zurück.
+    Nutzt die ONVIF-erkannte Sub-Stream URL (640x360).
+    Fällt auf Main-Stream zurück wenn kein Sub-Stream erkannt wurde.
     Kein Skalieren / kein Re-Encoding — reiner Passthrough.
     """
-    # Sub-Stream versuchen (niedrigere Auflösung → RPi4 schafft es locker)
-    for i, url in enumerate(_SUB_STREAM_URLS):
-        label = f"Sub-Stream URL {i+1}/{len(_SUB_STREAM_URLS)}"
-        print(f"Versuche {label}: {url}")
-        cmd = _build_cmd(url)
+    # ONVIF-erkannte Sub-Stream URL verwenden
+    sub_url = _get_sub_stream_url()
+
+    if sub_url:
+        print(f"Starte Live-Vorschau (ONVIF Sub-Stream): {sub_url}")
+        cmd = _build_cmd(sub_url)
         state.stream_proc = subprocess.Popen(cmd, stderr=sys.stderr)
         retcode = state.stream_proc.wait()
         if retcode == 0:
             return   # Benutzer hat Fenster geschlossen → sauber beenden
-        print(f"  → {label} fehlgeschlagen (exit {retcode})")
+        print(f"  → Sub-Stream fehlgeschlagen (exit {retcode})")
+    else:
+        print("  ⚠ Kein Sub-Stream per ONVIF erkannt!")
 
-    # Fallback: Main-Stream (4K HEVC — ohne Filter, RPi4 muss es schaffen)
-    print(f"Kein Sub-Stream verfügbar → Main-Stream: {RTSP_MAIN}")
-    print("  TIPP: probe_streams.py auf dem Pi ausführen um die richtige URL zu finden!")
+    # Fallback: Main-Stream (4K HEVC)
+    print(f"Fallback → Main-Stream: {RTSP_MAIN}")
     cmd = _build_cmd(RTSP_MAIN)
     state.stream_proc = subprocess.Popen(cmd, stderr=sys.stderr)
     state.stream_proc.wait()
