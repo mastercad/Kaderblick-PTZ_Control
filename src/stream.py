@@ -14,7 +14,7 @@ from config.config import RTSP_MAIN
 
 
 def _build_cmd(url):
-    """mpv-Kommando: reiner Passthrough, KEIN Re-Encoding/Skalieren."""
+    """mpv-Kommando: minimale Latenz für 640x360 H264."""
     return [
         'mpv',
         '--fullscreen',
@@ -26,18 +26,18 @@ def _build_cmd(url):
         '--demuxer-lavf-o='
             'fflags=+nobuffer+fastseek+discardcorrupt,'
             'rtsp_transport=tcp,'
-            'analyzeduration=500000,'
-            'probesize=65536',
-        '--demuxer-readahead-secs=0.5',
+            'analyzeduration=100000,'    # 100ms statt 500ms
+            'probesize=32768',           # 32KB reicht für 640x360
+        '--demuxer-readahead-secs=0',    # Kein Readahead-Buffer
         '--interpolation=no',
         '--video-latency-hacks=yes',
-        '--vd-lavc-threads=4',
-        # no: kein HW-Decode-Versuch → vermeidet VDPAU/CUDA/Vulkan-Warnungen
-        # RPi4 schafft 640x360 H264 locker in Software
+        '--vd-lavc-threads=2',           # 2 Threads reichen für 640x360
         '--hwdec=no',
         '--gpu-api=opengl',
         '--force-seekable=no',
-        '--framedrop=decoder+vo',
+        '--framedrop=vo',                # Nur VO-Framedrop (decoder behält alle)
+        '--untimed=no',
+        '--speed=1.01',                  # Minimalst schneller → holt Latenz auf
         '--title=PTZ Live',
         url,
     ]
