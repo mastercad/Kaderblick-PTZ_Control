@@ -50,11 +50,25 @@ Das bedeutet:
 
 Die Kamera liefert über ONVIF (`GetStreamUri`) drei Profile:
 
-| Profil       | Auflösung   | Codec   | RTSP-URL |
-|--------------|-------------|---------|----------|
-| **mainStream** | 3840×2160 | H.264   | `rtsp://192.168.178.122:554/user=admin_password=tlJwpbo6_channel=0_stream=0&onvif=0.sdp?real_stream` |
-| **subStream**  | 640×360   | H.264   | `rtsp://192.168.178.122:554/user=admin_password=tlJwpbo6_channel=0_stream=1&onvif=0.sdp?real_stream` |
-| **snapStream** | 704×576   | JPEG    | `rtsp://192.168.178.122:554/user=admin_password=tlJwpbo6_channel=0_stream=2&onvif=0.sdp?real_stream` |
+| Profil       | Auflösung   | ONVIF sagt | **Tatsächlich** | FPS | Bitrate | RTSP-URL |
+|--------------|-------------|------------|-----------------|-----|---------|----------|
+| **mainStream** | 3840×2160 | H.264     | **H.265 (HEVC)** | 17  | 6305 kbps | `rtsp://...stream=0...` |
+| **subStream**  | 640×360   | H.264     | **H.265 (HEVC)** | 25* | 106 kbps  | `rtsp://...stream=1...` |
+| **snapStream** | 704×576   | JPEG      | H.264           | 1   | 512 kbps  | `rtsp://...stream=2...` |
+
+> **⚠️ KRITISCH: ONVIF lügt über den Codec!** Beide Video-Streams sind **H.265 (HEVC)**, nicht H.264.
+> Dies wurde per ffprobe verifiziert und durch die DVRIP-Config (`Simplify.Encode`) bestätigt.
+> ONVIF `GetVideoEncoderConfiguration` meldet fälschlicherweise `H264` für alle Profile.
+>
+> *Sub-Stream FPS: Ab Werk **5 FPS** — per DVRIP auf **25 FPS** geändert (siehe Abschnitt 5.2).
+> Diese Einstellung geht möglicherweise bei Kamera-Neustart verloren!
+
+Vollständige RTSP-URLs:
+```
+Main: rtsp://192.168.178.122:554/user=admin_password=tlJwpbo6_channel=0_stream=0&onvif=0.sdp?real_stream
+Sub:  rtsp://192.168.178.122:554/user=admin_password=tlJwpbo6_channel=0_stream=1&onvif=0.sdp?real_stream
+Snap: rtsp://192.168.178.122:554/user=admin_password=tlJwpbo6_channel=0_stream=2&onvif=0.sdp?real_stream
+```
 
 ### RTSP-URL-Format (XM-spezifisch!)
 ```
@@ -78,10 +92,11 @@ rtsp://192.168.178.122:554/12                ← NICHT verwenden
 ```
 
 ### Wichtig: Stream-Auswahl
-- **Für Live-Vorschau auf Pi:** Sub-Stream (640×360 H264) verwenden!
+- **Für Live-Vorschau auf Pi:** Sub-Stream (640×360 H.265) verwenden!
   - 4K Main-Stream verursacht Vulkan OOM, DRM-Prime-Fehler, GPU-Überlastung
-  - 640×360 H264 wird problemlos per Software dekodiert (<10% GPU)
-- **Für Aufnahme:** Main-Stream (4K) per `ffmpeg -c:v copy` (kein Re-Encoding)
+  - 640×360 H.265 wird problemlos per Software dekodiert (<10% GPU)
+  - **FPS muss per DVRIP auf 25 gesetzt werden** — ab Werk nur 5 FPS!
+- **Für Aufnahme:** Main-Stream (4K H.265) per `ffmpeg -c:v copy` (kein Re-Encoding)
 
 ---
 
@@ -121,11 +136,24 @@ ptz_service.ContinuousMove(move_req)
 ptz_service.Stop({'ProfileToken': profile.token})
 ```
 
-### Performance der ONVIF-Calls
-- Jeder ContinuousMove/Stop ist ein **synchroner HTTP/SOAP Request**
-- Typische Latenz: **26-200ms pro Call** (Netzwerk + Kamera-Processing)
-- Bei hoher Last oder schlechtem WLAN: bis zu 500ms+
-- **Kritisch:** Muss in Non-Blocking-Thread ausgelagert werden, sonst blockiert der Control-Loop
+### Performance der ONVIF-Calls (gemessen mit diagnose/diagnose_ptz.py)
+| Operation       | Durchschnitt | Min    | Max    |
+|-----------------|-------------|--------|--------|
+| ContinuousMove  | **19 ms**   | 15 ms  | 35 ms  |
+| Stop            | **17 ms**   | 14 ms  | 30 ms  |
+
+- Jeder Call ist ein synchroner HTTP/SOAP Request
+- ~20ms ist schnell genug für **direkte synchrone Aufrufe** im Control-Loop
+- Ein Worker-Thread ist **NICHT nötig** (verursacht sogar Probleme, siehe Abschnitt 8)
+- Kamera hat **keinen Auto-Timeout** — ContinuousMove läuft unbegrenzt bis Stop kommt
+  (getestet: 67 Sekunden durchgehende Bewegung ohne Probleme)
+
+### ONVIF ist READ-ONLY für Konfiguration!
+**SetVideoEncoderConfiguration schlägt auf dieser Kamera IMMER fehl!**
+- Fehler: `"The configuration parameters are not possible to set"`
+- Getestet mit allen FPS-Werten (25, 20, 15, 10), allen Auflösungen, mit/ohne Multicast/SessionTimeout
+- Die Kamera akzeptiert **keine** Konfigurationsänderungen über ONVIF
+- **Lösung: Konfiguration über DVRIP** (Port 34567) — siehe Abschnitt 5.2
 
 ### Auto-Reconnect
 - Nach 3 aufeinanderfolgenden ONVIF-Fehlern: vollständiger Reconnect
@@ -234,6 +262,110 @@ def hash_password(password):
 }
 ```
 
+### 5.2 Encoding-Konfiguration (Simplify.Encode) — FPS ändern!
+
+Die vollständige Encoding-Config wird über `Simplify.Encode` gelesen/geschrieben.
+
+#### Aktuelle Konfiguration (nach FPS-Fix)
+```json
+{
+    "Simplify.Encode": [{
+        "ExtraFormat": [
+            {
+                "Audio": {"BitRate": 10, "MaxVolume": 10, "SampleRate": 10},
+                "AudioEnable": true,
+                "Video": {
+                    "BitRate": 106,
+                    "BitRateControl": "VBR",
+                    "Compression": "H.265",
+                    "FPS": 25,
+                    "GOP": 2,
+                    "Quality": 3,
+                    "Resolution": "QVGA",
+                    "VirtualGOP": 1
+                },
+                "VideoEnable": true
+            },
+            {
+                "Audio": {"BitRate": 10, "MaxVolume": 10, "SampleRate": 10},
+                "AudioEnable": true,
+                "Video": {
+                    "BitRate": 106,
+                    "BitRateControl": "VBR",
+                    "Compression": "H.265",
+                    "FPS": 25,
+                    "GOP": 2,
+                    "Quality": 3,
+                    "Resolution": "QVGA",
+                    "VirtualGOP": 1
+                },
+                "VideoEnable": true
+            }
+        ],
+        "MainFormat": [
+            {
+                "Video": {
+                    "BitRate": 6305,
+                    "BitRateControl": "VBR",
+                    "Compression": "H.265",
+                    "FPS": 17,
+                    "GOP": 2,
+                    "Quality": 6,
+                    "Resolution": "4K",
+                    "VirtualGOP": 1
+                },
+                "VideoEnable": true
+            }
+        ],
+        "SnapFormat": [
+            {
+                "Video": {
+                    "BitRate": 512,
+                    "BitRateControl": "VBR",
+                    "Compression": "H.264",
+                    "FPS": 1,
+                    "GOP": 2,
+                    "Quality": 4,
+                    "Resolution": "D1"
+                },
+                "VideoEnable": true
+            }
+        ]
+    }]
+}
+```
+
+#### Auflösungs-Kürzel (DVRIP → Pixel)
+| DVRIP-Name | Auflösung    |
+|------------|--------------|
+| `4K`       | 3840×2160    |
+| `QVGA`     | 640×360      |
+| `D1`       | 704×576      |
+
+#### FPS ändern per DVRIP
+```bash
+python3 diagnose/configure_stream_xm.py
+```
+Das Script:
+1. Liest `Simplify.Encode` Config
+2. Ändert `ExtraFormat[0].Video.FPS` auf 25
+3. Schreibt die gesamte Config zurück
+4. Verifiziert die Änderung
+
+**⚠️ Die FPS-Einstellung könnte bei Kamera-Neustart verloren gehen!**
+Nach jedem Neustart der Kamera prüfen und ggf. erneut setzen.
+
+#### Weitere verfügbare DVRIP-Configs
+| Config-Name              | Verfügbar | Inhalt |
+|--------------------------|-----------|--------|
+| `Simplify.Encode`        | ✅        | Encoding aller Streams (FPS, Bitrate, Codec, Auflösung) |
+| `AVEnc.Encode`           | ✅        | Identisch zu Simplify.Encode (anderer Accessor) |
+| `AVEnc.EncodeStaticParam`| ✅        | H.264/H.265 Level & Profile (`Level: 41, Profile: 3`) |
+| `AVEnc.SmartH264V2`      | ✅        | Smart H.264/H.265 Kompression (alle deaktiviert) |
+| `Camera.Param`           | ✅        | Kamera-Parameter (Belichtung, Gain, IR-Cut, Flip, WB) |
+| `Encode`                 | ❌        | Nicht verfügbar |
+| `fVideo.EncodeParam`     | ❌        | Nicht verfügbar |
+
 ---
 
 ## 6. AI-Tracking — Das Hauptproblem
@@ -330,18 +462,40 @@ Durch systematisches Testen (28 von 28 Configs erfolgreich gesetzt) wurden folge
 - **Ursache:** Standard-URLs (`/stream2`, `/12` etc.) existieren nicht auf dieser Kamera
 - **Fix:** ONVIF-Discovery → echte URL aus `GetStreamUri` verwenden
 
+#### Problem 6: ~1 Sekunde Video-Latenz
+- **Ursache:** Sub-Stream war ab Werk nur **5 FPS** — bei 5 FPS ist ~1s Latenz physikalisch unvermeidbar
+- **Diagnose:** `ffprobe` zeigte `5 fps, tbr, 5 tbn` im Sub-Stream (diagnose/diagnose_latenz.py)
+- **Zusatz-Erkenntnis:** Stream war H.265 (HEVC), nicht H.264 wie ONVIF behauptet!
+- **Fix:** FPS per DVRIP von 5 auf 25 erhöht (siehe Abschnitt 5.2)
+- **Ergebnis:** Latenz von ~1s auf **Echtzeit** reduziert
+
+#### Latenz-Optimierungen in mpv (alle angewendet)
+| Parameter | Wert | Zweck |
+|-----------|------|-------|
+| `rtsp_transport` | `udp` | Weniger Overhead als TCP |
+| `analyzeduration` | `0` | Kein Warten auf Stream-Analyse |
+| `probesize` | `1024` | Minimaler Probe-Buffer |
+| `fflags` | `+nobuffer+discardcorrupt+low_delay` | Minimale Pufferung |
+| `demuxer-readahead-secs` | `0` | Kein Vorauslesen |
+| `vd-lavc-threads` | `1` | Single-Thread (weniger Latenz) |
+| `no-correct-pts` | ja | Frames sofort anzeigen |
+| `opengl-swapinterval` | `0` | Kein VSync |
+| `speed` | `1.01` | Leicht beschleunigt (holt Verzögerung auf) |
+
 #### Finale Lösung
 ```
 mpv --fullscreen --no-audio --profile=low-latency --cache=no --cache-pause=no \
-    --demuxer-lavf-o=fflags=+nobuffer+fastseek+discardcorrupt,rtsp_transport=tcp,analyzeduration=500000,probesize=65536 \
-    --demuxer-readahead-secs=0.5 --interpolation=no --video-latency-hacks=yes \
-    --vd-lavc-threads=4 --hwdec=no --gpu-api=opengl --force-seekable=no \
+    --demuxer-lavf-o=fflags=+nobuffer+discardcorrupt+low_delay,rtsp_transport=udp,analyzeduration=0,probesize=1024 \
+    --demuxer-readahead-secs=0 --interpolation=no --video-latency-hacks=yes \
+    --vd-lavc-threads=1 --hwdec=no --gpu-api=opengl --force-seekable=no \
+    --no-correct-pts --opengl-swapinterval=0 --speed=1.01 \
     --framedrop=decoder+vo \
     "rtsp://192.168.178.122:554/user=admin_password=tlJwpbo6_channel=0_stream=1&onvif=0.sdp?real_stream"
 ```
-- Sub-Stream 640×360 H264 → Software-Decode → **funktioniert zuverlässig**
+- Sub-Stream 640×360 **H.265** → Software-Decode → **funktioniert zuverlässig**
 - **<10% GPU-Auslastung** auf dem Raspberry Pi
-- Bild aktualisiert sich flüssig, hängt nicht
+- Bild aktualisiert sich flüssig, nahezu Echtzeit
+- **Voraussetzung:** Sub-Stream muss auf 25 FPS gesetzt sein (diagnose/configure_stream_xm.py)
 
 ---
 
@@ -350,40 +504,56 @@ mpv --fullscreen --no-audio --profile=low-latency --cache=no --cache-pause=no \
 ### Problem: "EXTREM willkürliche" Steuerung
 Die Kamera reagierte erratisch auf Joystick-Eingaben, keine sinnvolle Echtzeitsteuerung möglich.
 
-### Ursachen (diagnostiziert)
+### Ursachen (chronologische Diagnose)
 
-1. **ONVIF-Calls blockieren den Control-Loop**
-   - Jeder `ContinuousMove()` / `Stop()` ist ein synchroner HTTP-Request (26-200ms)
-   - Bei 50ms Loop-Intervall (20 Hz) blockiert ein einziger Call den halben Zyklus
-   - Joystick-Eingaben gehen verloren, Befehle kommen verspätet
+#### Ursache 1: Software-SPI statt Hardware-SPI (spidev fehlte!)
+- **Symptom:** MCP3008 ADC lieferte extrem verrauschte Werte
+- **Fehlermeldung:** `SPISoftwareFallback!: failed to initialize hardware SPI, falling back to software`
+- **Diagnose (diagnose/diagnose_joystick.py):**
+  | | Software-SPI | Hardware-SPI |
+  |---|---|---|
+  | X-Jitter | **0.4221** | **0.0088** |
+  | Faktor | — | **48× besser** |
+- **Fix:** `pip install spidev` — gpiozero/MCP3008 nutzt dann automatisch Hardware-SPI
+- **Wichtig:** `spidev` ist in requirements.txt aufgenommen
 
-2. **ADC-Rauschen vom MCP3008**
-   - MCP3008 über SPI liefert verrauschte Werte (±2-5 LSB Jitter)
-   - Ohne Glättung: Werte pendeln ständig über Deadzone-Grenze
-   - Ergebnis: Move-Stop-Move-Stop-Chaos
+#### Ursache 2: Worker-Thread Race Condition (Hauptursache!)
+Der erste Lösungsansatz war ein Worker-Thread für ONVIF-Calls. **Das war falsch:**
+- Eine `_ptz_pending` Variable speicherte immer nur **den letzten Befehl**
+- **Race Condition 1:** Stop überschreibt Move → Kamera reagiert nicht
+- **Race Condition 2:** Move überschreibt Stop → Kamera dreht endlos weiter
+- Der Worker-Thread verarbeitete veraltete Befehle, aktuelle gingen verloren
 
-3. **Deadzone ohne Hysterese**
-   - Wert am Deadzone-Rand toggelt bei jedem Abtastzyklus
-   - Kamera bekommt widersprüchliche Befehle
+**Beweis:** Ein absoluter Minimal-Test OHNE Worker-Thread (test_ptz_minimal.py) — nur
+Joystick lesen → ONVIF direkt aufrufen — funktionierte **sofort perfekt**.
 
-### Lösung
+#### Ursache 3 (gering): ADC-Rauschen
+- Nach Hardware-SPI-Fix nur noch minimales Rauschen (Jitter 0.0088)
+- Deadzone (0.12) reicht aus, keine EMA-Glättung nötig
 
-1. **Non-Blocking PTZ-Worker-Thread**
-   - ONVIF-Befehle werden in Background-Thread ausgelagert
-   - Control-Loop queut nur den **jeweils letzten** Befehl (Fire-and-Forget)
-   - Ältere Befehle werden automatisch verworfen
-   - Loop wird nie mehr durch Netzwerk-Latenz blockiert
+### Lösung: Direkte synchrone ONVIF-Calls
 
-2. **Exponential Moving Average (EMA)**
-   - Alpha = 0.4 (Mischung: 40% neuer Wert, 60% alter Wert)
-   - Glättet ADC-Rauschen, erhält aber Reaktionsfähigkeit
-   - Angewendet auf X, Y und Zoom-Poti
+**KEIN Worker-Thread, KEIN EMA, KEINE Hysterese** — einfach direkt:
 
-3. **Deadzone mit Hysterese**
-   - Hysterese: 0.03 (zusätzlich zur Deadzone)
-   - Bewegung startet erst bei `DEADZONE + 0.03` (0.11)
-   - Bewegung stoppt erst bei `DEADZONE` (0.08)
-   - Verhindert Jitter-Toggeln am Rand
+1. **Direkte ONVIF-Calls im Control-Loop**
+   - ONVIF-Calls dauern nur ~20ms (gemessen!) → blockieren den 50ms-Loop kaum
+   - Kein Threading = keine Race Conditions
+   - Befehl wird sofort ausgeführt, nicht in Queue gepuffert
+
+2. **Auto-Kalibrierung beim Start**
+   - 30 Samples der Joystick/Poti-Ruheposition
+   - Deadzone relativ zur **tatsächlichen Mitte** (nicht fest 0.5)
+   - Kompensiert Fertigungstoleranzen des Joysticks
+
+3. **Änderungs-Schwellwert (_CHANGE_THRESH = 0.04)**
+   - Neuer Move-Befehl nur bei >4% Änderung der Geschwindigkeit
+   - Verhindert Spam bei Mikro-Schwankungen
+
+4. **Periodisches Re-Send (_RESEND_INTERVAL = 1.0s)**
+   - ContinuousMove wird alle 1s wiederholt (Sicherheit bei UDP-Paketverlust)
+
+### Ergebnis
+User-Zitat: **"die steuerung funktioniert JETZT GERADE nahezu PERFEKT!"**
 
 ---
 
@@ -414,13 +584,30 @@ Die Kamera reagierte erratisch auf Joystick-Eingaben, keine sinnvolle Echtzeitst
 ### Hardware-Anbindung (MCP3008 ADC)
 ```
 MCP3008 über SPI:
-  Channel 0 → Zoom-Poti (0.0 - 1.0)
+  Channel 0 → Zoom-Poti (0.0 - 1.0)  [aktuell nicht angeschlossen]
   Channel 2 → Joystick Y (0.0 - 1.0, Mitte ≈ 0.5)
   Channel 3 → Joystick X (0.0 - 1.0, Mitte ≈ 0.5)
 
 GPIO:
   Pin 17   → Joystick-Button (Pull-Up, active low)
 ```
+
+### SPI: Hardware vs. Software — KRITISCH!
+| | Software-SPI (Fallback) | Hardware-SPI (spidev) |
+|---|---|---|
+| Jitter X-Achse | 0.4221 | **0.0088** |
+| Jitter Y-Achse | 0.3950 | **0.0075** |
+| Noise-Floor | ±2-5 LSB | ±0.1 LSB |
+| PTZ-Steuerung | **Unbrauchbar** | Perfekt |
+
+**Hardware-SPI erfordert das `spidev` Python-Paket!**
+```bash
+pip install spidev
+```
+Ohne `spidev` fällt gpiozero/MCP3008 **stillschweigend** auf Software-SPI zurück.
+Einziger Hinweis: `SPISoftwareFallback!` in stderr (leicht zu übersehen).
+
+Diagnosetool: `python3 diagnose/diagnose_joystick.py`
 
 ---
 
@@ -455,28 +642,72 @@ ffmpeg -rtsp_transport tcp \
 2. **ONVIF-Port nicht Standard** — Port 8899, nicht 80/8080. Viele ONVIF-Tools finden die Kamera nicht automatisch.
 3. **Passwort in RTSP-URL ist ein Hash** — Nicht das Klartext-Passwort! Der Hash `tlJwpbo6` entspricht einem leeren Passwort.
 4. **Config-Keys sind Case-Sensitiv und inkonsistent** — `PtzAutoTrack` vs. `PTZAutoTrack` vs. `AutoTracking` — alle drei existieren als separate Configs.
-5. **Dual-Protocol-Zwang** — ONVIF für PTZ+Streams, aber XM/DVRIP für AI-Config. Kein einzelnes Protokoll deckt alles ab.
+5. **Dual-Protocol-Zwang** — ONVIF für PTZ+Streams, aber XM/DVRIP für AI+Encoding-Config. Kein einzelnes Protokoll deckt alles ab.
+6. **ONVIF lügt über Codecs** — Meldet H.264 für beide Streams, tatsächlich ist es H.265 (HEVC)!
+7. **ONVIF ist Read-Only für Config** — SetVideoEncoderConfiguration wird abgelehnt. FPS/Bitrate/Codec nur per DVRIP änderbar.
+8. **Sub-Stream ab Werk 5 FPS** — Verursacht ~1s Latenz. Muss per DVRIP auf 25 FPS gesetzt werden.
+9. **FPS-Einstellung evtl. nicht persistent** — Nach Kamera-Neustart prüfen und ggf. erneut setzen.
 
 ### Raspberry Pi-seitig
-1. **Kein Hardware-Decode für 4K** — Weder V4L2 noch DRM prime funktionieren zuverlässig für 3840×2160 H264
+1. **Kein Hardware-Decode für 4K** — Weder V4L2 noch DRM prime funktionieren zuverlässig für 3840×2160
 2. **Vulkan crasht bei großen Texturen** — `VK_ERROR_OUT_OF_HOST_MEMORY`
 3. **`--untimed` zerstört RTSP** — mpv Option die bei lokalen Dateien Sinn macht, aber RTSP-Streams einfriert
 4. **`--video-sync=audio` + `--no-audio`** → mpv-Fehler (sich widersprechende Optionen)
 5. **`--demuxer-lavf-o` nur EINMAL** — Bei doppelter Angabe ignoriert mpv die zweite, keine Warnung
+6. **`spidev` Paket MUSS installiert sein** — Ohne fällt MCP3008 auf Software-SPI zurück (48× mehr Jitter)
 
 ### Steuerungs-seitig
-1. **MCP3008 ADC rauscht** — ±2-5 LSB Jitter, EMA-Glättung zwingend nötig
-2. **ONVIF ist langsam** — HTTP/SOAP Round-Trip 26-200ms, blockiert den Control-Loop wenn synchron aufgerufen
-3. **ContinuousMove braucht expliziten Stop** — Kamera bewegt sich endlos bis `Stop()` kommt. Stop muss 3× wiederholt werden (Paketverlust).
+1. **MCP3008 ADC rauscht nur bei Software-SPI** — Mit Hardware-SPI (spidev) ist Jitter minimal (0.0088)
+2. **ONVIF-Calls sind schnell genug für synchrone Aufrufe** — ~20ms, kein Worker-Thread nötig
+3. **Worker-Thread verursacht Race Conditions** — Single-Slot-Queue = Stop überschreibt Move oder umgekehrt. NICHT verwenden!
+4. **ContinuousMove braucht expliziten Stop** — Kamera bewegt sich endlos bis `Stop()` kommt. Hat keinen Auto-Timeout (67s getestet).
 
 ---
 
 ## 12. Diagnose-Tools
 
-### probe_streams.py
+Alle Diagnose-Tools befinden sich im Ordner `diagnose/`.
+
+### diagnose/diagnose_joystick.py
+Prüft SPI-Modus (Hardware vs. Software), misst Jitter aller ADC-Kanäle:
+```bash
+python3 diagnose/diagnose_joystick.py
+```
+
+### diagnose/diagnose_ptz.py
+Misst ONVIF PTZ-Performance (Move/Stop-Latenz, Auto-Timeout-Test):
+```bash
+python3 diagnose/diagnose_ptz.py
+```
+
+### diagnose/diagnose_latenz.py
+Analysiert Stream-Latenz, prüft tatsächlichen Codec und FPS per ffprobe:
+```bash
+python3 diagnose/diagnose_latenz.py
+```
+
+### diagnose/configure_stream_xm.py
+Ändert Sub-Stream FPS über DVRIP (ONVIF kann das nicht!):
+```bash
+python3 diagnose/configure_stream_xm.py
+```
+
+### diagnose/configure_stream.py
+Versuch FPS über ONVIF zu ändern (scheitert — nur als Dokumentation behalten).
+
+### diagnose/test_ptz_minimal.py
+Absolut minimaler PTZ-Test (Joystick → ONVIF direkt, kein Threading):
+```bash
+python3 diagnose/test_ptz_minimal.py
+```
+
+### diagnose/test_xm_protocol.py
+Test der XM/DVRIP-Verbindung und Config-Zugriffe.
+
+### diagnose/probe_streams.py
 Testet 20 verschiedene RTSP-URLs per ffprobe und zeigt welche funktionieren:
 ```bash
-python3 probe_streams.py
+python3 diagnose/probe_streams.py
 ```
 
 ### device_debug.py
@@ -522,9 +753,17 @@ PTZ_Control/
 │   ├── stream.py           # Live-Vorschau (mpv)
 │   ├── recording.py        # Aufnahme + Screenshot (ffmpeg)
 │   └── overlay.py          # Tkinter-Overlay (Aufnahme/AI-Warnung)
-├── probe_streams.py        # Diagnose: RTSP-URL-Tester
-├── device_debug.py         # Diagnose: Kamera-Debug
-└── requirements.txt        # Python-Abhängigkeiten
+├── diagnose/
+│   ├── configure_stream.py      # ONVIF FPS-Versuch (scheitert)
+│   ├── configure_stream_xm.py   # DVRIP FPS-Konfiguration (funktioniert!)
+│   ├── diagnose_joystick.py     # SPI/ADC Jitter-Messung
+│   ├── diagnose_ptz.py          # ONVIF PTZ Performance-Test
+│   ├── diagnose_latenz.py       # Stream-Latenz & Codec-Analyse
+│   ├── probe_streams.py         # RTSP-URL-Tester
+│   ├── test_ptz_minimal.py      # Minimaler PTZ-Test (ohne Threading)
+│   └── test_xm_protocol.py      # XM/DVRIP Verbindungstest
+├── device_debug.py              # Diagnose: Kamera-Debug
+└── requirements.txt             # Python-Abhängigkeiten
 ```
 
 ---
@@ -555,3 +794,45 @@ scp -r PTZ_Control/* kaderblick@192.168.178.10:/home/kaderblick/camera_control/
 cd /home/kaderblick/camera_control
 python3 main.py
 ```
+
+## 16. Kamera Config — ONVIF vs. DVRIP Vergleich
+
+### ONVIF GetVideoEncoderConfigurationOptions (Sub-Stream)
+> ⚠️ Diese Daten sind **teilweise falsch** — ONVIF meldet H264, tatsächlich ist es H.265!
+
+```json
+{
+    "ResolutionsAvailable": [
+        {"Width": 704, "Height": 576},
+        {"Width": 800, "Height": 448},
+        {"Width": 352, "Height": 288},
+        {"Width": 640, "Height": 360}
+    ],
+    "FrameRateRange": {"Min": 1, "Max": 25},
+    "GovLengthRange": {"Min": 1, "Max": 300},
+    "EncodingIntervalRange": {"Min": 0, "Max": 1},
+    "H264ProfilesSupported": ["Baseline", "Main", "High"],
+    "QualityRange": {"Min": 1, "Max": 6}
+}
+```
+
+### DVRIP Simplify.Encode — Die Wahrheit
+| Eigenschaft | Main-Stream | Sub-Stream | Snap-Stream |
+|-------------|-------------|------------|-------------|
+| **Codec** | **H.265** | **H.265** | H.264 |
+| Auflösung | 3840×2160 (4K) | 640×360 (QVGA) | 704×576 (D1) |
+| FPS | 17 | 25 (ab Werk: 5!) | 1 |
+| Bitrate | 6305 kbps (VBR) | 106 kbps (VBR) | 512 kbps (VBR) |
+| GOP | 2 | 2 | 2 |
+| Quality | 6 | 3 | 4 |
+| Audio | Ja (10 kbps) | Ja (10 kbps) | Nein |
+
+### Protokoll-Fähigkeiten
+| Operation | ONVIF | DVRIP |
+|-----------|-------|-------|
+| Stream-URLs abfragen | ✅ | ❌ |
+| PTZ-Steuerung | ✅ (~20ms) | ✅ (ungetestet) |
+| Encoding-Config **lesen** | ✅ (aber falsche Codec-Angaben!) | ✅ (korrekt) |
+| Encoding-Config **schreiben** | ❌ (immer Fehler) | ✅ |
+| AI-Tracking Config | ❌ | ✅ |
+| Kamera-Parameter (Belichtung etc.) | ❌ | ✅ |
