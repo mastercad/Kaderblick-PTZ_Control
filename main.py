@@ -243,14 +243,17 @@ def _find_enabled_in_config(data):
     return False
 
 
-def check_ai_tracking_active():
+def check_ai_tracking_active(sock=None, session_id=None):
     """
     Prüft ob KI-Tracking auf der Kamera aktiv ist.
+    Kann eine bestehende Verbindung wiederverwenden (Performance!).
     Gibt (aktiv: bool, details: list[str]) zurück.
     """
-    sock, session_id = _xm_connect_and_login()
-    if sock is None:
-        return None, ["XM-Verbindung fehlgeschlagen"]
+    own_connection = sock is None
+    if own_connection:
+        sock, session_id = _xm_connect_and_login()
+        if sock is None:
+            return None, ["XM-Verbindung fehlgeschlagen"]
 
     active_configs = []
     try:
@@ -261,21 +264,25 @@ def check_ai_tracking_active():
                 if _find_enabled_in_config(config_data):
                     active_configs.append(config_name)
     finally:
-        sock.close()
+        if own_connection:
+            sock.close()
 
     is_active = len(active_configs) > 0
     return is_active, active_configs
 
 
-def disable_ai_tracking():
+def disable_ai_tracking(sock=None, session_id=None):
     """
     Deaktiviert das KI-Tracking über XM Binary Protocol (Port 34567).
+    Kann eine bestehende Verbindung wiederverwenden (Performance!).
     Gibt die Anzahl erfolgreicher Deaktivierungen zurück.
     """
-    sock, session_id = _xm_connect_and_login()
-    if sock is None:
-        print("  ⚠ XM-Verbindung fehlgeschlagen")
-        return 0
+    own_connection = sock is None
+    if own_connection:
+        sock, session_id = _xm_connect_and_login()
+        if sock is None:
+            print("  ⚠ XM-Verbindung fehlgeschlagen")
+            return 0
 
     success_count = 0
     try:
@@ -304,7 +311,8 @@ def disable_ai_tracking():
             if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
                 success_count += 1
     finally:
-        sock.close()
+        if own_connection:
+            sock.close()
 
     return success_count
 
@@ -312,20 +320,24 @@ def disable_ai_tracking():
 def ensure_ai_disabled():
     """
     Prüft ob AI aktiv ist und deaktiviert sie sofort falls ja.
+    Nutzt eine einzige TCP-Verbindung für Check + Disable.
     Gibt (war_aktiv, anzahl_deaktiviert) zurück.
     """
-    is_active, details = check_ai_tracking_active()
-
-    if is_active is None:
-        # Verbindung fehlgeschlagen
+    sock, session_id = _xm_connect_and_login()
+    if sock is None:
         return None, 0
 
-    if not is_active:
-        return False, 0
+    try:
+        is_active, details = check_ai_tracking_active(sock, session_id)
 
-    # AI ist aktiv! Sofort deaktivieren
-    count = disable_ai_tracking()
-    return True, count
+        if is_active is None or not is_active:
+            return is_active or False, 0
+
+        # AI ist aktiv! Sofort deaktivieren (gleiche Verbindung)
+        count = disable_ai_tracking(sock, session_id)
+        return True, count
+    finally:
+        sock.close()
 
 
 # ============================================================
@@ -347,41 +359,47 @@ def ai_watchdog_loop():
 
     while running:
         try:
-            is_active, details = check_ai_tracking_active()
-
-            if is_active is None:
-                # Verbindungsfehler — nicht sofort panik machen
+            # Eine Verbindung für den gesamten Zyklus (Check + ggf. Disable + Verify)
+            sock, session_id = _xm_connect_and_login()
+            if sock is None:
                 consecutive_failures += 1
                 if consecutive_failures >= 3:
                     print("  ⚠ AI-Watchdog: Kamera nicht erreichbar (3x)")
                     consecutive_failures = 0
-            elif is_active:
-                consecutive_failures = 0
-                ai_warning_active = True
-                _ensure_overlay_running()
-                detail_str = ", ".join(details)
-                print(f"\n  🚨 AI-TRACKING AKTIV ERKANNT: {detail_str}")
-                print(f"  → Deaktiviere automatisch...")
-
-                count = disable_ai_tracking()
-                if count > 0:
-                    print(f"  ✓ {count} Feature(s) re-deaktiviert")
-                    # Nochmal prüfen ob es gewirkt hat
-                    time.sleep(1)
-                    still_active, _ = check_ai_tracking_active()
-                    if not still_active:
-                        print(f"  ✓ AI-Tracking erfolgreich gestoppt")
-                        ai_warning_active = False
-                    else:
-                        print(f"  ⚠ AI-Tracking IMMER NOCH aktiv!")
-                        print(f"    → Manuell über iCSee/XMEye App deaktivieren!")
-                else:
-                    print(f"  ⚠ Deaktivierung fehlgeschlagen!")
             else:
-                consecutive_failures = 0
-                if ai_warning_active:
-                    print(f"  ✓ AI-Tracking ist jetzt aus.")
-                    ai_warning_active = False
+                try:
+                    is_active, details = check_ai_tracking_active(sock, session_id)
+
+                    if is_active is None:
+                        consecutive_failures += 1
+                    elif is_active:
+                        consecutive_failures = 0
+                        ai_warning_active = True
+                        _ensure_overlay_running()
+                        detail_str = ", ".join(details)
+                        print(f"\n  🚨 AI-TRACKING AKTIV ERKANNT: {detail_str}")
+                        print(f"  → Deaktiviere automatisch...")
+
+                        count = disable_ai_tracking(sock, session_id)
+                        if count > 0:
+                            print(f"  ✓ {count} Feature(s) re-deaktiviert")
+                            time.sleep(1)
+                            still_active, _ = check_ai_tracking_active(sock, session_id)
+                            if not still_active:
+                                print(f"  ✓ AI-Tracking erfolgreich gestoppt")
+                                ai_warning_active = False
+                            else:
+                                print(f"  ⚠ AI-Tracking IMMER NOCH aktiv!")
+                                print(f"    → Manuell über iCSee/XMEye App deaktivieren!")
+                        else:
+                            print(f"  ⚠ Deaktivierung fehlgeschlagen!")
+                    else:
+                        consecutive_failures = 0
+                        if ai_warning_active:
+                            print(f"  ✓ AI-Tracking ist jetzt aus.")
+                            ai_warning_active = False
+                finally:
+                    sock.close()
 
         except Exception as e:
             print(f"  AI-Watchdog Fehler: {e}")
@@ -447,18 +465,23 @@ def stop_recording():
 # Screenshot
 # ============================================================
 def take_screenshot():
+    """Screenshot im Hintergrund-Thread (blockiert nicht den Control-Loop)."""
     filename = time.strftime('screenshot_%Y%m%d_%H%M%S.jpg')
     filepath = os.path.join(RECORDING_DIR, filename)
-    cmd = [
-        'ffmpeg', '-y',
-        '-rtsp_transport', 'tcp',
-        '-i', RTSP_MAIN,
-        '-frames:v', '1',
-        '-q:v', '2',
-        filepath
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"📸 Screenshot: {filepath}")
+
+    def _capture():
+        cmd = [
+            'ffmpeg', '-y',
+            '-rtsp_transport', 'tcp',
+            '-i', RTSP_MAIN,
+            '-frames:v', '1',
+            '-q:v', '2',
+            filepath
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"📸 Screenshot: {filepath}")
+
+    threading.Thread(target=_capture, daemon=True).start()
 
 # ============================================================
 # Live-Vorschau (Sub-Stream, Low-Latency)
@@ -472,6 +495,8 @@ def show_stream():
     global stream_proc
 
     # mpv Low-Latency Konfiguration
+    # WICHTIG: --demuxer-lavf-o darf nur EINMAL vorkommen (letzter gewinnt!)
+    # Alle lavf-Optionen müssen in einem einzigen Flag kombiniert werden.
     cmd = [
         'mpv',
         '--fullscreen',
@@ -480,15 +505,16 @@ def show_stream():
         '--untimed',                        # Frames sofort anzeigen
         '--no-cache',                       # Kein Cache
         '--cache-pause=no',                 # Nie pausieren um zu puffern
-        '--demuxer-lavf-o=fflags=+nobuffer+fastseek', # ffmpeg: kein Puffer
-        '--demuxer-lavf-o=rtsp_transport=tcp',        # TCP statt UDP
+        '--demuxer-lavf-o=fflags=+nobuffer+fastseek,rtsp_transport=tcp,analyzeduration=0,probesize=32',
         '--demuxer-readahead-secs=0',       # Kein Vorauslesen
         '--interpolation=no',               # Kein Frame-Interpolation
-        '--video-sync=audio',               # Kein Audio → Display-Sync
+        '--video-sync=display-resample',    # Display-basierter Sync (kein Audio)
         '--video-latency-hacks=yes',        # Experimentelle Latenz-Hacks
         '--vd-lavc-threads=4',              # Mehr Decoder-Threads
         '--hwdec=auto-safe',                # Hardware-Decoding wenn möglich
         '--force-seekable=no',              # Kein Seeking → Live
+        '--framedrop=decoder+vo',           # Frames droppen statt Latenz aufbauen
+        '--display-fps-override=30',        # Max-FPS begrenzen → weniger CPU
         f'--title=PTZ Live',
         RTSP_SUB                            # Sub-Stream verwenden!
     ]
@@ -574,21 +600,25 @@ def show_overlay():
 # ============================================================
 # PTZ-Steuerung — nur bei Änderung senden!
 # ============================================================
+# Request-Objekte einmal erstellen und wiederverwenden
+# (sonst wird bei JEDEM Joystick-Move ein neues SOAP-Objekt gebaut)
+_ptz_move_req = ptz_service.create_type('ContinuousMove')
+_ptz_move_req.ProfileToken = profile.token
+_ptz_stop_req = {'ProfileToken': profile.token}
+
 def send_continuous_move(pan, tilt, zoom_speed):
     try:
-        req = ptz_service.create_type('ContinuousMove')
-        req.ProfileToken = profile.token
-        req.Velocity = {
+        _ptz_move_req.Velocity = {
             'PanTilt': {'x': float(pan), 'y': float(tilt)},
             'Zoom': {'x': float(zoom_speed)}
         }
-        ptz_service.ContinuousMove(req)
+        ptz_service.ContinuousMove(_ptz_move_req)
     except Exception as e:
         print(f"PTZ ContinuousMove Fehler: {e}")
 
 def send_stop():
     try:
-        ptz_service.Stop({'ProfileToken': profile.token})
+        ptz_service.Stop(_ptz_stop_req)
     except Exception as e:
         print(f"PTZ Stop Fehler: {e}")
 
