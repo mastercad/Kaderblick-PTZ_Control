@@ -1,4 +1,5 @@
 onvif_zeep
 gpiozero
 lgpio
+spidev
 adafruit-circuitpython-mcp3xxx
