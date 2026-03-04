@@ -14,7 +14,7 @@ from config.config import RTSP_MAIN
 
 
 def _build_cmd(url):
-    """mpv-Kommando: minimale Latenz für 640x360 H264."""
+    """mpv-Kommando: absolute Minimal-Latenz für 640x360 H264."""
     return [
         'mpv',
         '--fullscreen',
@@ -25,19 +25,20 @@ def _build_cmd(url):
         # WICHTIG: --demuxer-lavf-o darf nur EINMAL vorkommen!
         '--demuxer-lavf-o='
             'fflags=+nobuffer+fastseek+discardcorrupt,'
-            'rtsp_transport=tcp,'
-            'analyzeduration=100000,'    # 100ms statt 500ms
-            'probesize=32768',           # 32KB reicht für 640x360
-        '--demuxer-readahead-secs=0',    # Kein Readahead-Buffer
+            'rtsp_transport=udp,'         # UDP statt TCP → weniger Latenz
+            'analyzeduration=0,'           # Sofort loslegen
+            'probesize=1024',              # Absolutes Minimum
+        '--demuxer-readahead-secs=0',      # Kein Buffer
         '--interpolation=no',
         '--video-latency-hacks=yes',
-        '--vd-lavc-threads=2',           # 2 Threads reichen für 640x360
+        '--vd-lavc-threads=1',             # 1 Thread = kein Frame-Reordering-Delay
+        '--vd-lavc-o=flags=+low_delay',    # Low-Delay Decoding
+        '--no-correct-pts',                # Kein PTS-Sorting → sofort anzeigen
         '--hwdec=no',
         '--gpu-api=opengl',
+        '--opengl-swapinterval=0',         # Kein VSync-Warten
         '--force-seekable=no',
-        '--framedrop=vo',                # Nur VO-Framedrop (decoder behält alle)
-        '--untimed=no',
-        '--speed=1.01',                  # Minimalst schneller → holt Latenz auf
+        '--framedrop=vo',
         '--title=PTZ Live',
         url,
     ]
