@@ -73,6 +73,8 @@ stream_proc = None
 ffmpeg_proc = None
 overlay_thread = None
 overlay_running = False
+ai_warning_active = False      # True wenn AI-Tracking erkannt wurde
+ai_watchdog_thread = None
 
 # ============================================================
 # ONVIF Kamera-Setup
@@ -86,7 +88,7 @@ profile  = profiles[0]
 print(f"Verbunden. Profil: {profile.Name}")
 
 # ============================================================
-# KI-Tracking deaktivieren (XM Binary Protocol, Port 34567)
+# XM Binary Protocol — Verbindung & Hilfsfunktionen
 # ============================================================
 def _xm_hash_password(password):
     """XM-Kameras nutzen ein spezielles Password-Hashing."""
@@ -128,24 +130,18 @@ def _xm_recv_response(sock, timeout=3):
         return None
 
 
-def disable_ai_tracking():
+def _xm_connect_and_login():
     """
-    Versucht das KI-Tracking über das XM Binary Protocol (Port 34567) zu deaktivieren.
-    HTTP-CGI funktioniert bei dieser Kamera nicht ("Not support this POST method").
+    Stellt eine XM-Verbindung her und loggt ein.
+    Gibt (sock, session_id) zurück oder (None, None) bei Fehler.
     """
-    print("Versuche KI-Tracking zu deaktivieren (XM Binary Protocol)...")
-
-    # Verbinden
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
         sock.connect((CAMERA_IP, 34567))
-    except Exception as e:
-        print(f"  ⚠ XM-Verbindung fehlgeschlagen: {e}")
-        print("    → Deaktiviere Tracking manuell über iCSee/XMEye App")
-        return
+    except Exception:
+        return None, None
 
-    # Login
     hashed_pw = _xm_hash_password(PASSWORD)
     login_data = json.dumps({
         "EncryptType": "MD5", "LoginType": "DVRIP-Web",
@@ -155,69 +151,256 @@ def disable_ai_tracking():
     result = _xm_recv_response(sock)
 
     if not isinstance(result, dict) or result.get("Ret") != 100:
-        print(f"  ⚠ XM-Login fehlgeschlagen: {result}")
         sock.close()
-        return
+        return None, None
 
     session_str = result.get("SessionID", "0x00000000")
     session_id = int(session_str, 16) if isinstance(session_str, str) and session_str.startswith("0x") else 0
-    print(f"  ✓ XM-Login OK (Session: {session_id:#010x})")
+    return sock, session_id
 
-    # Disable-Befehle senden (CONFIG_SET = msg_id 1040)
-    disable_configs = [
-        ("Detect.HumanDetection", {"Enable": False}),
-        ("Detect.SmartDetect", {"Enable": False}),
-        ("Detect.HumanoidDetect", {"Enable": False}),
-        ("Alarm.SmartAlarm", {"Enable": False, "HumanoidEnable": False,
-                               "SmdEnable": False, "AiEnable": False}),
-        ("Camera.PtzAutoTrack", {"Enable": False}),
-        ("Camera.PTZAutoTrack", {"Enable": False}),
-        ("fVideo.IntelliTrace", {"Enable": False}),
-        ("fVideo.IntelliTrack", {"Enable": False}),
-        ("Camera.GuardTour", {"Enable": False}),
-    ]
+
+def _xm_get_config(sock, session_id, config_name):
+    """Liest eine Konfiguration. Gibt (erfolg, daten) zurück."""
+    payload = json.dumps({
+        "Name": config_name,
+        "SessionID": f"0x{session_id:08X}"
+    }).encode('utf-8') + b'\x0a'
+    sock.sendall(_xm_build_packet(1042, session_id, payload))
+    resp = _xm_recv_response(sock, timeout=2)
+    if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
+        return True, resp
+    return False, resp
+
+
+def _xm_set_config(sock, session_id, config_name, config_data):
+    """Setzt eine Konfiguration. Gibt True/False zurück."""
+    payload = json.dumps({
+        "Name": config_name,
+        config_name: config_data,
+        "SessionID": f"0x{session_id:08X}"
+    }).encode('utf-8') + b'\x0a'
+    sock.sendall(_xm_build_packet(1040, session_id, payload))
+    resp = _xm_recv_response(sock, timeout=2)
+    return isinstance(resp, dict) and resp.get("Ret") in (0, 100)
+
+
+# ============================================================
+# AI-Tracking Check — prüft ob HumanDetection etc. aktiv ist
+# ============================================================
+# Config-Namen die auf AI-Tracking hindeuten
+AI_CHECK_CONFIGS = [
+    "Detect.HumanDetection",    # Haupt-Verursacher (war bei dir aktiv!)
+    "Camera.PtzAutoTrack",
+    "Camera.PTZAutoTrack",
+    "fVideo.IntelliTrace",
+    "fVideo.IntelliTrack",
+]
+
+# Alle Config-Namen zum Deaktivieren (breiterer Satz)
+AI_DISABLE_CONFIGS = [
+    ("Detect.HumanDetection", {"Enable": False}),
+    ("Detect.SmartDetect", {"Enable": False}),
+    ("Detect.HumanoidDetect", {"Enable": False}),
+    ("Alarm.SmartAlarm", {"Enable": False, "HumanoidEnable": False,
+                           "SmdEnable": False, "AiEnable": False}),
+    ("Alarm.HumanAlarm", {"Enable": False}),
+    ("Alarm.HumanDetection", {"Enable": False}),
+    ("fVideo.SmartDetect", {"Enable": False}),
+    ("NetWork.NetSmartDetect", {"Enable": False}),
+    ("Camera.PtzAutoTrack", {"Enable": False}),
+    ("Camera.PTZAutoTrack", {"Enable": False}),
+    ("PTZAutoTrack", {"Enable": False}),
+    ("Ptz.AutoTracking", {"Enable": False}),
+    ("Ptz.AutoTrack", {"Enable": False}),
+    ("fVideo.IntelliTrace", {"Enable": False}),
+    ("fVideo.IntelliTrack", {"Enable": False}),
+    ("IntelliTrace", {"Enable": False}),
+    ("Camera.PtzTrack", {"Enable": False}),
+    ("PTZTrack", {"Enable": False, "AutoTrack": False}),
+    ("Camera.GuardTour", {"Enable": False}),
+]
+
+
+def _find_enabled_in_config(data):
+    """
+    Prüft rekursiv ob ein Enable-Feld auf True steht.
+    Gibt True zurück wenn irgendeine AI-relevante Einstellung aktiv ist.
+    """
+    if isinstance(data, dict):
+        for key, val in data.items():
+            key_lower = key.lower()
+            if key_lower in ("enable", "enabled", "autotrackenable",
+                             "humanoidenable", "smdenable", "aienable"):
+                if val is True or val == 1 or (isinstance(val, str) and val.lower() in ("true", "1")):
+                    return True
+            elif isinstance(val, (dict, list)):
+                if _find_enabled_in_config(val):
+                    return True
+    elif isinstance(data, list):
+        for item in data:
+            if _find_enabled_in_config(item):
+                return True
+    return False
+
+
+def check_ai_tracking_active():
+    """
+    Prüft ob KI-Tracking auf der Kamera aktiv ist.
+    Gibt (aktiv: bool, details: list[str]) zurück.
+    """
+    sock, session_id = _xm_connect_and_login()
+    if sock is None:
+        return None, ["XM-Verbindung fehlgeschlagen"]
+
+    active_configs = []
+    try:
+        for config_name in AI_CHECK_CONFIGS:
+            ok, data = _xm_get_config(sock, session_id, config_name)
+            if ok and isinstance(data, dict):
+                config_data = data.get(config_name, data)
+                if _find_enabled_in_config(config_data):
+                    active_configs.append(config_name)
+    finally:
+        sock.close()
+
+    is_active = len(active_configs) > 0
+    return is_active, active_configs
+
+
+def disable_ai_tracking():
+    """
+    Deaktiviert das KI-Tracking über XM Binary Protocol (Port 34567).
+    Gibt die Anzahl erfolgreicher Deaktivierungen zurück.
+    """
+    sock, session_id = _xm_connect_and_login()
+    if sock is None:
+        print("  ⚠ XM-Verbindung fehlgeschlagen")
+        return 0
 
     success_count = 0
-    for config_name, config_data in disable_configs:
-        payload = json.dumps({
-            "Name": config_name,
-            config_name: config_data,
-            "SessionID": f"0x{session_id:08X}"
-        }).encode('utf-8') + b'\x0a'
-        sock.sendall(_xm_build_packet(1040, session_id, payload))
-        resp = _xm_recv_response(sock, timeout=2)
-        if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
-            print(f"  ✓ {config_name} deaktiviert")
-            success_count += 1
+    try:
+        # Config-basierte Deaktivierung
+        for config_name, config_data in AI_DISABLE_CONFIGS:
+            if _xm_set_config(sock, session_id, config_name, config_data):
+                success_count += 1
 
-    # PTZ-Stop-Befehle (Tour/AutoScan stoppen)
-    for stop_cmd in ["AutoScanStop", "TourStop"]:
-        payload = json.dumps({
-            "Name": "OPPTZControl",
-            "OPPTZControl": {
-                "Command": stop_cmd,
-                "Parameter": {
-                    "AUX": {"Number": 0, "Status": "On"}, "Channel": 0,
-                    "MenuOpts": "Enter",
-                    "POINT": {"bottom": 0, "left": 0, "right": 0, "top": 0},
-                    "Pattern": "SetBegin", "Preset": 0, "Step": 0, "Tour": 0
-                }
-            },
-            "SessionID": f"0x{session_id:08X}"
-        }).encode('utf-8') + b'\x0a'
-        sock.sendall(_xm_build_packet(1400, session_id, payload))
-        resp = _xm_recv_response(sock, timeout=2)
-        if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
-            success_count += 1
+        # PTZ-Stop-Befehle
+        for stop_cmd in ["AutoScanStop", "TourStop"]:
+            payload = json.dumps({
+                "Name": "OPPTZControl",
+                "OPPTZControl": {
+                    "Command": stop_cmd,
+                    "Parameter": {
+                        "AUX": {"Number": 0, "Status": "On"}, "Channel": 0,
+                        "MenuOpts": "Enter",
+                        "POINT": {"bottom": 0, "left": 0, "right": 0, "top": 0},
+                        "Pattern": "SetBegin", "Preset": 0, "Step": 0, "Tour": 0
+                    }
+                },
+                "SessionID": f"0x{session_id:08X}"
+            }).encode('utf-8') + b'\x0a'
+            sock.sendall(_xm_build_packet(1400, session_id, payload))
+            resp = _xm_recv_response(sock, timeout=2)
+            if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
+                success_count += 1
+    finally:
+        sock.close()
 
-    sock.close()
+    return success_count
 
-    if success_count > 0:
-        print(f"  {success_count} Feature(s) deaktiviert.")
-    else:
-        print("  ⚠ Kein Befehl war erfolgreich.")
-        print("    → Deaktiviere Tracking manuell über iCSee/XMEye App")
-        print("    → oder starte: python3 disable_ai_tracking.py")
+
+def ensure_ai_disabled():
+    """
+    Prüft ob AI aktiv ist und deaktiviert sie sofort falls ja.
+    Gibt (war_aktiv, anzahl_deaktiviert) zurück.
+    """
+    is_active, details = check_ai_tracking_active()
+
+    if is_active is None:
+        # Verbindung fehlgeschlagen
+        return None, 0
+
+    if not is_active:
+        return False, 0
+
+    # AI ist aktiv! Sofort deaktivieren
+    count = disable_ai_tracking()
+    return True, count
+
+
+# ============================================================
+# AI-Watchdog — periodische Überwachung im Hintergrund
+# ============================================================
+AI_CHECK_INTERVAL = 30  # Sekunden zwischen den Checks
+
+def ai_watchdog_loop():
+    """
+    Läuft im Hintergrund und prüft periodisch ob AI-Tracking aktiv ist.
+    Bei Erkennung: sofort deaktivieren + visuell warnen.
+    """
+    global ai_warning_active
+
+    # Erster Check direkt nach Start
+    time.sleep(5)
+
+    consecutive_failures = 0
+
+    while running:
+        try:
+            is_active, details = check_ai_tracking_active()
+
+            if is_active is None:
+                # Verbindungsfehler — nicht sofort panik machen
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    print("  ⚠ AI-Watchdog: Kamera nicht erreichbar (3x)")
+                    consecutive_failures = 0
+            elif is_active:
+                consecutive_failures = 0
+                ai_warning_active = True
+                _ensure_overlay_running()
+                detail_str = ", ".join(details)
+                print(f"\n  🚨 AI-TRACKING AKTIV ERKANNT: {detail_str}")
+                print(f"  → Deaktiviere automatisch...")
+
+                count = disable_ai_tracking()
+                if count > 0:
+                    print(f"  ✓ {count} Feature(s) re-deaktiviert")
+                    # Nochmal prüfen ob es gewirkt hat
+                    time.sleep(1)
+                    still_active, _ = check_ai_tracking_active()
+                    if not still_active:
+                        print(f"  ✓ AI-Tracking erfolgreich gestoppt")
+                        ai_warning_active = False
+                    else:
+                        print(f"  ⚠ AI-Tracking IMMER NOCH aktiv!")
+                        print(f"    → Manuell über iCSee/XMEye App deaktivieren!")
+                else:
+                    print(f"  ⚠ Deaktivierung fehlgeschlagen!")
+            else:
+                consecutive_failures = 0
+                if ai_warning_active:
+                    print(f"  ✓ AI-Tracking ist jetzt aus.")
+                    ai_warning_active = False
+
+        except Exception as e:
+            print(f"  AI-Watchdog Fehler: {e}")
+
+        # Warte bis zum nächsten Check (aber reagiere auf running=False)
+        for _ in range(AI_CHECK_INTERVAL * 10):
+            if not running:
+                return
+            time.sleep(0.1)
+
+def _ensure_overlay_running():
+    """Startet das Overlay falls es nicht schon läuft."""
+    global overlay_thread, overlay_running
+    if overlay_thread is not None and overlay_thread.is_alive():
+        return  # Läuft schon
+    overlay_running = True
+    overlay_thread = threading.Thread(target=show_overlay, daemon=True)
+    overlay_thread.start()
+
 
 # ============================================================
 # Aufnahme (Main-Stream in voller Qualität)
@@ -242,10 +425,7 @@ def start_recording():
     )
     recording = True
     print(f"🔴 Aufnahme gestartet: {filepath}")
-    # Overlay starten
-    overlay_running = True
-    overlay_thread = threading.Thread(target=show_overlay, daemon=True)
-    overlay_thread.start()
+    _ensure_overlay_running()
 
 def stop_recording():
     global ffmpeg_proc, recording, overlay_running
@@ -325,7 +505,7 @@ def show_stream():
         stream_proc.wait()
 
 # ============================================================
-# Aufnahme-Overlay (blinkendes "● Aufnahme")
+# Aufnahme-Overlay (blinkendes "● Aufnahme" + AI-Warnung)
 # ============================================================
 def show_overlay():
     root = tk.Tk()
@@ -334,23 +514,57 @@ def show_overlay():
     root.attributes('-alpha', 0.7)
     root.configure(bg='black')
     screen_width = root.winfo_screenwidth()
-    w, h = 220, 60
+    w, h = 280, 100
     x = screen_width - w - 10
     y = 10
     root.geometry(f'{w}x{h}+{x}+{y}')
-    label = tk.Label(
+
+    # Aufnahme-Label
+    rec_label = tk.Label(
         root, text='● Aufnahme PTZ',
-        font=('Arial', 20, 'bold'), fg='red', bg='black'
+        font=('Arial', 18, 'bold'), fg='red', bg='black'
     )
-    label.pack(expand=True, fill='both')
+    rec_label.pack(fill='x', pady=(5, 0))
+
+    # AI-Warnung-Label (nur sichtbar wenn AI aktiv)
+    ai_label = tk.Label(
+        root, text='',
+        font=('Arial', 14, 'bold'), fg='yellow', bg='black'
+    )
+    ai_label.pack(fill='x', pady=(2, 5))
+
     blink = True
 
     def update():
         nonlocal blink
-        if not overlay_running:
+        if not overlay_running and not ai_warning_active:
             root.destroy()
             return
-        label.config(fg='red' if blink else 'black')
+
+        # Aufnahme-Indikator
+        if overlay_running:
+            rec_label.config(
+                text='● Aufnahme PTZ',
+                fg='red' if blink else 'darkred'
+            )
+        else:
+            rec_label.config(text='', fg='black')
+
+        # AI-Warnung
+        if ai_warning_active:
+            ai_label.config(
+                text='⚠ AI-TRACKING AKTIV!' if blink else '  AI-TRACKING AKTIV!',
+                fg='yellow' if blink else 'red'
+            )
+        else:
+            ai_label.config(text='', fg='black')
+
+        # Fenster-Größe anpassen
+        if overlay_running and ai_warning_active:
+            root.geometry(f'{w}x{h}+{x}+{y}')
+        elif overlay_running or ai_warning_active:
+            root.geometry(f'{w}x60+{x}+{y}')
+
         blink = not blink
         root.after(500, update)
 
@@ -482,21 +696,50 @@ signal.signal(signal.SIGTERM, cleanup)
 # Main
 # ============================================================
 if __name__ == "__main__":
-    # KI-Tracking beim Start deaktivieren
-    disable_ai_tracking()
+    # Beim Start: AI prüfen und deaktivieren
+    print("Prüfe AI-Tracking Status...")
+    was_active, count = ensure_ai_disabled()
+    if was_active is None:
+        print("  ⚠ Konnte AI-Status nicht prüfen (Verbindungsfehler)")
+        print("    → Versuche trotzdem blind zu deaktivieren...")
+        count = disable_ai_tracking()
+        if count > 0:
+            print(f"  ✓ {count} Feature(s) deaktiviert")
+        else:
+            print("  ⚠ Deaktivierung fehlgeschlagen")
+            print("    → Ggf. manuell über iCSee/XMEye App deaktivieren")
+    elif was_active:
+        print(f"  🚨 AI-Tracking war AKTIV → {count} Feature(s) deaktiviert")
+        # Verifizieren
+        still_active, details = check_ai_tracking_active()
+        if still_active:
+            print(f"  ⚠ WARNUNG: AI immer noch aktiv: {', '.join(details)}")
+            ai_warning_active = True
+        else:
+            print(f"  ✓ AI-Tracking erfolgreich deaktiviert")
+    else:
+        print(f"  ✓ AI-Tracking ist AUS — alles gut!")
 
+    print()
     print("Starte PTZ-Steuerung...")
     print("  Joystick → Pan/Tilt")
     print("  Poti     → Zoom")
     print("  Button kurz  → Screenshot")
     print("  Button 3s    → Aufnahme Start/Stop")
+    print(f"  AI-Watchdog   → prüft alle {AI_CHECK_INTERVAL}s (automatische Re-Deaktivierung)")
     print()
 
-    t_stream  = threading.Thread(target=show_stream, daemon=True)
-    t_control = threading.Thread(target=control_loop, daemon=True)
+    t_stream   = threading.Thread(target=show_stream, daemon=True)
+    t_control  = threading.Thread(target=control_loop, daemon=True)
+    t_watchdog = threading.Thread(target=ai_watchdog_loop, daemon=True)
 
     t_stream.start()
     t_control.start()
+    t_watchdog.start()
+
+    # Overlay wenn AI-Warnung beim Start schon aktiv
+    if ai_warning_active:
+        _ensure_overlay_running()
 
     # Warten bis Stream-Fenster geschlossen wird
     try:

@@ -1,0 +1,180 @@
+============================================================
+  Hiseeu HD118-PZ — KI-Tracking Diagnose & Deaktivierung
+  Protokoll: XM Binary (Port 34567)
+============================================================
+
+============================================================
+1. Kamera-Informationen über ONVIF
+============================================================
+  Hersteller:   H264
+  Modell:       IPC_NT98566_N8S
+  Firmware:     V5.00.R02.M62749O7.10010.140600.S.ONVIF 21.06
+  Seriennummer: 1a3ae7e7183fa7c8tjmg
+  Hardware:     00001
+
+============================================================
+2. XM Binary Protocol — Login (Port 34567)
+============================================================
+  ✓ Verbunden mit 192.168.178.122:34567
+  ✓ Login erfolgreich — SessionID: 0x0000001e
+
+============================================================
+3. System-Informationen & Fähigkeiten (XM Binary)
+============================================================
+
+  --- SystemInfo ---
+  AlarmInChannel: 0
+  AlarmOutChannel: 0
+  AudioInChannel: 1
+  BuildTime: 2025-07-09 11:07:14
+  CombineSwitch: 0
+  DeviceModel: IPC_NT98566_N8S
+  DeviceRunTime: 0x00000e80
+  DeviceType: 0
+  DigChannel: 0
+  EncryptVersion: Unknown
+  ExtraChannel: 0
+  HardWare: IPC_NT98566_N8S
+  HardWareVersion: Unknown
+  SerialNo: 1a3ae7e7183fa7c8tjmg
+  SoftWareVersion: V5.00.R02.M62749O7.10010.140600.0020000
+  TalkInChannel: 1
+  TalkOutChannel: 1
+  UpdataTime: 
+  UpdataType: 0x00000000
+  VideoInChannel: 1
+  VideoOutChannel: 1
+
+  --- Geräte-Fähigkeiten ---
+  ✓ SystemFunction:
+      SystemFunction:
+          AlarmFunction:
+              AlarmConfig: True
+              BlindDetect: True
+              CarShapeDetection: True
+              FaceDetect: True
+              HumanDection: True
+              HumanPedDetection: True
+              LossDetect: True
+              ManuAlertAlarm: True
+              MotionDetect: True
+              NetAlarm: True
+              PEAInHumanPed: True
+              StorageFailure: True
+              SupportVehicleShowTrack: True
+  ✓ OPSystemFunction:
+      SystemFunction:
+          AlarmFunction:
+              AlarmConfig: True
+              BlindDetect: True
+              CarShapeDetection: True
+              FaceDetect: True
+              HumanDection: True
+              HumanPedDetection: True
+              LossDetect: True
+              ManuAlertAlarm: True
+              MotionDetect: True
+              NetAlarm: True
+              PEAInHumanPed: True
+              StorageFailure: True
+              SupportVehicleShowTrack: True
+
+============================================================
+4. KI/Tracking-Konfigurationen auslesen (XM Binary)
+============================================================
+
+  --- AI / Smart Detection ---
+  ✓ Detect.HumanDetection:
+      [0]: {"AlgoCreate": true, "Enable": true, "ObjectType": 0, "PedFdrAlg": 1, "PedRule": [{"Enable": true, "RuleLine": {"AlarmDi
+
+  --- Auto-Tracking / PTZ ---
+
+  --- Guard Tour / Patrol ---
+
+  --- Motion Detection ---
+  ✓ Detect.MotionDetect:
+      [0]: {"AlarmType": 0, "Enable": true, "EventHandler": {"AlarmInfo": "", "AlarmOutEnable": false, "AlarmOutLatch": 10, "AlarmO
+
+  --- Allgemeine Kamera-Config ---
+  ✓ Camera.Param:
+      [0]: {"AeSensitivity": 5, "ApertureMode": "0x00000000", "BLCMode": "0x00000000", "DayNightColor": "0x00000004", "Day_nfLevel"
+      [1]: {"AeSensitivity": 0, "ApertureMode": "0x00000000", "BLCMode": "0x00000000", "DayNightColor": "0x00000000", "Day_nfLevel"
+      [2]: {"AeSensitivity": 0, "ApertureMode": "0x00000000", "BLCMode": "0x00000000", "DayNightColor": "0x00000000", "Day_nfLevel"
+      ... (32 Einträge)
+  ✓ Camera.ParamEx:
+      [0]: {"AeMeansure": 0, "AutomaticAdjustment": 3, "BroadTrends": {"AutoGain": 1, "Gain": 50}, "CorridorMode": 0, "DayNightSwit
+  ✓ AVEnc.SmartH264:
+      [0]: {"SmartH264": false}
+
+============================================================
+5. KI-Tracking deaktivieren (XM Binary Protocol)
+============================================================
+
+  --- Gefundene Configs deaktivieren ---
+  ✓ Detect.HumanDetection → DEAKTIVIERT (Array)
+  ✓ Detect.MotionDetect → DEAKTIVIERT (Array)
+  ✓ Camera.Param → DEAKTIVIERT (Array)
+  ✓ Camera.ParamEx → DEAKTIVIERT (Array)
+  ✓ AVEnc.SmartH264 → DEAKTIVIERT (Array)
+
+  --- Blinde Disable-Befehle ---
+  ✓ Detect.SmartDetect → DEAKTIVIERT
+  ✓ Detect.HumanoidDetect → DEAKTIVIERT
+  ✓ Alarm.SmartAlarm → DEAKTIVIERT
+  ✓ Alarm.HumanAlarm → DEAKTIVIERT
+  ✓ Alarm.HumanDetection → DEAKTIVIERT
+  ✓ fVideo.SmartDetect → DEAKTIVIERT
+  ✓ NetWork.NetSmartDetect → DEAKTIVIERT
+  ✓ Camera.PtzAutoTrack → DEAKTIVIERT
+  ✓ Camera.PTZAutoTrack → DEAKTIVIERT
+  ✓ PTZAutoTrack → DEAKTIVIERT
+  ✓ Ptz.AutoTracking → DEAKTIVIERT
+  ✓ Ptz.AutoTrack → DEAKTIVIERT
+  ✓ fVideo.IntelliTrace → DEAKTIVIERT
+  ✓ fVideo.IntelliTrack → DEAKTIVIERT
+  ✓ IntelliTrace → DEAKTIVIERT
+  ✓ Camera.PtzTrack → DEAKTIVIERT
+  ✓ PTZTrack → DEAKTIVIERT
+  ✓ Camera.GuardTour → DEAKTIVIERT
+  ✓ Camera.GuardCruise → DEAKTIVIERT
+  ✓ GuardTour → DEAKTIVIERT
+
+  --- PTZ-Tracking via OPPTZControl stoppen ---
+  ✓ AutoScanStop gesendet
+  ✓ TourStop gesendet
+  ✓ PatternStop gesendet
+
+============================================================
+ERGEBNIS: 28 Deaktivierung(en) erfolgreich!
+============================================================
+  ✓ Detect.HumanDetection
+  ✓ Detect.MotionDetect
+  ✓ Camera.Param
+  ✓ Camera.ParamEx
+  ✓ AVEnc.SmartH264
+  ✓ Detect.SmartDetect
+  ✓ Detect.HumanoidDetect
+  ✓ Alarm.SmartAlarm
+  ✓ Alarm.HumanAlarm
+  ✓ Alarm.HumanDetection
+  ✓ fVideo.SmartDetect
+  ✓ NetWork.NetSmartDetect
+  ✓ Camera.PtzAutoTrack
+  ✓ Camera.PTZAutoTrack
+  ✓ PTZAutoTrack
+  ✓ Ptz.AutoTracking
+  ✓ Ptz.AutoTrack
+  ✓ fVideo.IntelliTrace
+  ✓ fVideo.IntelliTrack
+  ✓ IntelliTrace
+  ✓ Camera.PtzTrack
+  ✓ PTZTrack
+  ✓ Camera.GuardTour
+  ✓ Camera.GuardCruise
+  ✓ GuardTour
+  ✓ PTZ:AutoScanStop
+  ✓ PTZ:TourStop
+  ✓ PTZ:PatternStop
+
+  → Starte 'python3 main.py' und teste ob das Tracking weg ist.
+Verbindung geschlossen.
