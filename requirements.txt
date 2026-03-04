@@ -2,4 +2,3 @@ onvif_zeep
 gpiozero
 lgpio
 adafruit-circuitpython-mcp3xxx
-requests

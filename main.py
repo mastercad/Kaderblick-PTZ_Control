@@ -20,11 +20,13 @@ Latenz-Optimierungen:
 import time
 import os
 import json
+import socket
+import struct
+import hashlib
 import subprocess
 import threading
 import signal
 import sys
-import requests
 from onvif import ONVIFCamera
 from gpiozero import MCP3008, Button
 import tkinter as tk
@@ -84,60 +86,131 @@ profile  = profiles[0]
 print(f"Verbunden. Profil: {profile.Name}")
 
 # ============================================================
-# KI-Tracking deaktivieren (XM JSON-RPC, POST!)
+# KI-Tracking deaktivieren (XM Binary Protocol, Port 34567)
 # ============================================================
+def _xm_hash_password(password):
+    """XM-Kameras nutzen ein spezielles Password-Hashing."""
+    m = hashlib.md5(password.encode('utf-8') if password else b"").digest()
+    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    return "".join(chars[(m[2*i] + m[2*i+1]) % len(chars)] for i in range(8))
+
+
+def _xm_build_packet(msg_id, session_id, data_bytes):
+    """Baut ein XM/DVRIP-Paket (20 Byte Header + Daten)."""
+    header = struct.pack(
+        '<BBBB I I BB H I',
+        0xFF, 0x00, 0x00, 0x00,
+        session_id, 0, 0, 0,
+        msg_id, len(data_bytes),
+    )
+    return header + data_bytes
+
+
+def _xm_recv_response(sock, timeout=3):
+    """Empfängt und parst eine XM/DVRIP-Antwort."""
+    sock.settimeout(timeout)
+    try:
+        header = b''
+        while len(header) < 20:
+            chunk = sock.recv(20 - len(header))
+            if not chunk:
+                return None
+            header += chunk
+        _, _, _, _, _, _, _, _, msg_id, data_len = struct.unpack('<BBBB I I BB H I', header)
+        data = b''
+        while len(data) < data_len:
+            chunk = sock.recv(min(data_len - len(data), 4096))
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.rstrip(b'\x00\x0a').decode('utf-8', errors='replace'))
+    except Exception:
+        return None
+
+
 def disable_ai_tracking():
     """
-    Versucht das KI-Tracking der XM/Xiongmai-Kamera zu deaktivieren.
-    Nutzt POST mit JSON-Body (nicht GET — GET gibt nur "Not support GET method").
+    Versucht das KI-Tracking über das XM Binary Protocol (Port 34567) zu deaktivieren.
+    HTTP-CGI funktioniert bei dieser Kamera nicht ("Not support this POST method").
     """
-    print("Versuche KI-Tracking zu deaktivieren...")
-    cgi_url = f"http://{CAMERA_IP}/cgi-bin/param.cgi"
+    print("Versuche KI-Tracking zu deaktivieren (XM Binary Protocol)...")
 
-    # Befehle mit verschiedenen Parameternamen für verschiedene FW-Versionen
-    disable_commands = [
-        ("Smart Alarm", "setSmartAlarm", {
-            "SmartAlarm": {"Enable": False, "HumanoidEnable": False,
-                           "SmdEnable": False, "AiEnable": False}
-        }),
-        ("Human Detection", "setHumanDetection", {
-            "HumanDetection": {"Enable": False}
-        }),
-        ("Auto-Track", "setAutoTrack", {
-            "AutoTrack": {"Enable": False}
-        }),
-        ("PTZ Auto-Track", "setPTZAutoTrack", {
-            "PTZAutoTrack": {"Enable": False}
-        }),
-        ("Intelli-Trace", "setIntelliTraceConfig", {
-            "IntelliTraceConfig": {"Enable": False}
-        }),
-        ("Guard Tour", "setGuardTour", {
-            "GuardTour": {"Enable": False}
-        }),
+    # Verbinden
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((CAMERA_IP, 34567))
+    except Exception as e:
+        print(f"  ⚠ XM-Verbindung fehlgeschlagen: {e}")
+        print("    → Deaktiviere Tracking manuell über iCSee/XMEye App")
+        return
+
+    # Login
+    hashed_pw = _xm_hash_password(PASSWORD)
+    login_data = json.dumps({
+        "EncryptType": "MD5", "LoginType": "DVRIP-Web",
+        "PassWord": hashed_pw, "UserName": USERNAME
+    }).encode('utf-8') + b'\x0a'
+    sock.sendall(_xm_build_packet(1000, 0, login_data))
+    result = _xm_recv_response(sock)
+
+    if not isinstance(result, dict) or result.get("Ret") != 100:
+        print(f"  ⚠ XM-Login fehlgeschlagen: {result}")
+        sock.close()
+        return
+
+    session_str = result.get("SessionID", "0x00000000")
+    session_id = int(session_str, 16) if isinstance(session_str, str) and session_str.startswith("0x") else 0
+    print(f"  ✓ XM-Login OK (Session: {session_id:#010x})")
+
+    # Disable-Befehle senden (CONFIG_SET = msg_id 1040)
+    disable_configs = [
+        ("Detect.HumanDetection", {"Enable": False}),
+        ("Detect.SmartDetect", {"Enable": False}),
+        ("Detect.HumanoidDetect", {"Enable": False}),
+        ("Alarm.SmartAlarm", {"Enable": False, "HumanoidEnable": False,
+                               "SmdEnable": False, "AiEnable": False}),
+        ("Camera.PtzAutoTrack", {"Enable": False}),
+        ("Camera.PTZAutoTrack", {"Enable": False}),
+        ("fVideo.IntelliTrace", {"Enable": False}),
+        ("fVideo.IntelliTrack", {"Enable": False}),
+        ("Camera.GuardTour", {"Enable": False}),
     ]
 
     success_count = 0
-    for name, cmd, params in disable_commands:
-        data = {"cmd": cmd}
-        data.update(params)
-        try:
-            r = requests.post(cgi_url, json=data, timeout=3)
-            if r.status_code == 200:
-                text = r.text.strip()
-                # Prüfe ob es WIRKLICH Erfolg war
-                if "Not support" in text:
-                    continue  # Befehl nicht unterstützt, kein Fehler
-                try:
-                    result = json.loads(text)
-                    ret = result.get("Ret", -1)
-                    if ret in (0, 100):
-                        print(f"  ✓ {name} deaktiviert")
-                        success_count += 1
-                except json.JSONDecodeError:
-                    pass
-        except requests.exceptions.RequestException:
-            pass
+    for config_name, config_data in disable_configs:
+        payload = json.dumps({
+            "Name": config_name,
+            config_name: config_data,
+            "SessionID": f"0x{session_id:08X}"
+        }).encode('utf-8') + b'\x0a'
+        sock.sendall(_xm_build_packet(1040, session_id, payload))
+        resp = _xm_recv_response(sock, timeout=2)
+        if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
+            print(f"  ✓ {config_name} deaktiviert")
+            success_count += 1
+
+    # PTZ-Stop-Befehle (Tour/AutoScan stoppen)
+    for stop_cmd in ["AutoScanStop", "TourStop"]:
+        payload = json.dumps({
+            "Name": "OPPTZControl",
+            "OPPTZControl": {
+                "Command": stop_cmd,
+                "Parameter": {
+                    "AUX": {"Number": 0, "Status": "On"}, "Channel": 0,
+                    "MenuOpts": "Enter",
+                    "POINT": {"bottom": 0, "left": 0, "right": 0, "top": 0},
+                    "Pattern": "SetBegin", "Preset": 0, "Step": 0, "Tour": 0
+                }
+            },
+            "SessionID": f"0x{session_id:08X}"
+        }).encode('utf-8') + b'\x0a'
+        sock.sendall(_xm_build_packet(1400, session_id, payload))
+        resp = _xm_recv_response(sock, timeout=2)
+        if isinstance(resp, dict) and resp.get("Ret") in (0, 100):
+            success_count += 1
+
+    sock.close()
 
     if success_count > 0:
         print(f"  {success_count} Feature(s) deaktiviert.")
