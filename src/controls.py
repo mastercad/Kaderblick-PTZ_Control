@@ -1,11 +1,15 @@
 """
 Steuerungs-Loop — Joystick, Poti, Button → PTZ / Aufnahme.
 
-Nicht-blockierende ONVIF-Befehle + Input-Smoothing für reaktive Steuerung.
+Einfach & direkt:
+  - ONVIF-Calls dauern nur ~20ms → direkte Aufrufe, kein Worker-Thread
+  - Auto-Kalibrierung der Joystick/Poti-Ruheposition beim Start
+  - Deadzone bezogen auf kalibrierte Mitte (nicht fest 0.5)
+  - Periodisches Re-Send als Sicherheit
+  - Debug-Ausgabe zum Nachvollziehen
 """
 
 import time
-import threading
 
 from src import hardware as hw
 from src import onvif_ptz as ptz
@@ -13,143 +17,117 @@ from src import recording
 import src.state as state
 from config.config import (
     PAN_MAX, TILT_MAX, ZOOM_MAX,
-    DEADZONE, ZOOM_DEADZONE_LO, ZOOM_DEADZONE_HI,
+    DEADZONE, ZOOM_DEADZONE,
     LOOP_SLEEP,
 )
 
-# ── Smoothing & Deadzone ─────────────────────────────────────
-_EMA_ALPHA    = 0.4      # Exponential Moving Average (0.0=glatt, 1.0=roh)
-_HYSTERESIS   = 0.03     # Deadzone-Hysterese: Wert muss DEADZONE+HYSTERESIS
-                          # überschreiten bevor Bewegung startet
-_CHANGE_THRESH = 0.05    # Mindest-Änderung bevor neuer Move-Befehl gesendet wird
+# ── Konstanten ────────────────────────────────────────────────
+_CHANGE_THRESH = 0.04     # Mindest-Änderung für neuen Move-Befehl
+_RESEND_INTERVAL = 1.0    # ContinuousMove alle 1s wiederholen (Sicherheit)
+_CALIBRATION_SAMPLES = 30  # Anzahl Samples für Auto-Kalibrierung
+_DEBUG = True              # Debug-Ausgaben an/aus
 
 
-# ── Nicht-blockierende PTZ-Befehle ──────────────────────────
-# ONVIF SOAP-Calls können 26-200ms dauern und würden den Loop blockieren.
-# Deshalb: Fire-and-forget in Worker-Thread.
-_ptz_lock = threading.Lock()
-_ptz_pending = None       # (typ, pan, tilt, zoom) oder ("stop",)
+def _calibrate():
+    """
+    Liest N Samples im Ruhezustand und bestimmt die Mittelposition.
+    MUSS bei Programmstart aufgerufen werden (Joystick/Poti nicht berühren!).
+    """
+    print("  Kalibriere Joystick/Poti (NICHT BERÜHREN!) ...", flush=True)
+    sx, sy, sz = 0.0, 0.0, 0.0
+    for _ in range(_CALIBRATION_SAMPLES):
+        sx += hw.joy_x.value
+        sy += hw.joy_y.value
+        sz += hw.pot.value
+        time.sleep(0.02)
+
+    cx = sx / _CALIBRATION_SAMPLES
+    cy = sy / _CALIBRATION_SAMPLES
+    cz = sz / _CALIBRATION_SAMPLES
+
+    print(f"  Kalibriert: X={cx:.4f}  Y={cy:.4f}  Zoom={cz:.4f}")
+    return cx, cy, cz
 
 
-def _ptz_worker():
-    """Background-Worker: sendet den jeweils LETZTEN PTZ-Befehl."""
-    global _ptz_pending
-    while state.running:
-        cmd = None
-        with _ptz_lock:
-            if _ptz_pending is not None:
-                cmd = _ptz_pending
-                _ptz_pending = None
-
-        if cmd is not None:
-            try:
-                if cmd[0] == "move":
-                    ptz.continuous_move(cmd[1], cmd[2], cmd[3])
-                elif cmd[0] == "stop":
-                    ptz.stop()
-            except Exception as e:
-                print(f"  ⚠ PTZ-Worker Fehler: {e}")
-        else:
-            time.sleep(0.01)  # 10ms idle-sleep wenn nichts zu tun
-
-
-def _send_move(pan, tilt, zoom):
-    """Nicht-blockierend: queut einen ContinuousMove-Befehl."""
-    global _ptz_pending
-    with _ptz_lock:
-        _ptz_pending = ("move", pan, tilt, zoom)
-
-
-def _send_stop():
-    """Nicht-blockierend: queut einen Stop-Befehl."""
-    global _ptz_pending
-    with _ptz_lock:
-        _ptz_pending = ("stop",)
-
-
-def _apply_deadzone(value, was_active):
-    """Deadzone mit Hysterese: verhindert Jitter am Rand."""
-    threshold = DEADZONE if was_active else (DEADZONE + _HYSTERESIS)
-    if abs(value) < threshold:
-        return 0.0, False
-    return value, True
+def _apply_deadzone(value, deadzone):
+    """Wendet Deadzone an und skaliert den Rest auf 0.0-1.0."""
+    if abs(value) <= deadzone:
+        return 0.0
+    sign = 1.0 if value > 0 else -1.0
+    scaled = (abs(value) - deadzone) / (1.0 - deadzone)
+    return sign * min(scaled, 1.0)
 
 
 def control_loop():
     """Hauptschleife: liest Hardware ein und steuert PTZ + Aufnahme."""
 
-    # PTZ-Worker starten
-    worker = threading.Thread(target=_ptz_worker, daemon=True)
-    worker.start()
+    # Auto-Kalibrierung
+    center_x, center_y, center_z = _calibrate()
 
     btn_last_state = False
     btn_press_time = None
     btn_action_done = False
 
-    prev_moving = False
-    prev_pan = 0.0
-    prev_tilt = 0.0
-    prev_zoom = 0.0
+    # PTZ-Zustand
+    currently_moving = False
+    last_pan = 0.0
+    last_tilt = 0.0
+    last_zoom = 0.0
+    last_cmd_time = 0.0
 
-    # EMA-Zustand
-    ema_x = 0.5    # MCP3008 liefert 0.0-1.0, Mitte = 0.5
-    ema_y = 0.5
-    ema_z = 512.0  # Poti-Mitte
-
-    # Hysterese-Zustand
-    pan_active = False
-    tilt_active = False
-
-    stop_sent_count = 0
-    _STOP_REPEAT = 3
+    print("  Steuerung aktiv.\n")
 
     while state.running:
         try:
-            # ── Joystick / Poti einlesen + Glätten ───────────
-            ema_x = _EMA_ALPHA * hw.joy_x.value + (1 - _EMA_ALPHA) * ema_x
-            ema_y = _EMA_ALPHA * hw.joy_y.value + (1 - _EMA_ALPHA) * ema_y
-            ema_z = _EMA_ALPHA * (hw.pot.value * 1023) + (1 - _EMA_ALPHA) * ema_z
+            # ── Hardware einlesen ─────────────────────────────
+            raw_x = hw.joy_x.value
+            raw_y = hw.joy_y.value
+            raw_z = hw.pot.value
 
-            raw_pan  = (ema_x * 2.0 - 1.0) * PAN_MAX
-            raw_tilt = (ema_y * 2.0 - 1.0) * TILT_MAX
+            # Relativ zur kalibrierten Mitte (-1.0 bis +1.0)
+            rel_x = (raw_x - center_x) * 2.0
+            rel_y = (raw_y - center_y) * 2.0
+            rel_z = (raw_z - center_z) * 2.0
 
-            pan, pan_active   = _apply_deadzone(raw_pan, pan_active)
-            tilt, tilt_active = _apply_deadzone(raw_tilt, tilt_active)
+            # Deadzone + Skalierung
+            pan  = _apply_deadzone(rel_x, DEADZONE) * PAN_MAX
+            tilt = _apply_deadzone(rel_y, DEADZONE) * TILT_MAX
+            zoom = _apply_deadzone(rel_z, ZOOM_DEADZONE) * ZOOM_MAX
 
-            raw_z = int(ema_z)
-            zoom_speed = 0.0
-            if raw_z < ZOOM_DEADZONE_LO:
-                zoom_speed = -(ZOOM_DEADZONE_LO - raw_z) / ZOOM_DEADZONE_LO * ZOOM_MAX
-            elif raw_z > ZOOM_DEADZONE_HI:
-                zoom_speed = (raw_z - ZOOM_DEADZONE_HI) / (1023 - ZOOM_DEADZONE_HI) * ZOOM_MAX
+            # ── PTZ-Logik (direkt, kein Worker) ──────────────
+            now = time.time()
+            want_move = (pan != 0.0 or tilt != 0.0 or zoom != 0.0)
 
-            # ── PTZ-Befehle (nicht-blockierend) ──────────────
-            is_moving = (pan != 0.0 or tilt != 0.0 or zoom_speed != 0.0)
-
-            if is_moving:
-                stop_sent_count = 0
+            if want_move:
                 value_changed = (
-                    abs(pan - prev_pan) > _CHANGE_THRESH or
-                    abs(tilt - prev_tilt) > _CHANGE_THRESH or
-                    abs(zoom_speed - prev_zoom) > _CHANGE_THRESH
+                    abs(pan - last_pan) > _CHANGE_THRESH or
+                    abs(tilt - last_tilt) > _CHANGE_THRESH or
+                    abs(zoom - last_zoom) > _CHANGE_THRESH
                 )
-                if not prev_moving or value_changed:
-                    _send_move(pan, tilt, zoom_speed)
-                    prev_pan = pan
-                    prev_tilt = tilt
-                    prev_zoom = zoom_speed
-            elif prev_moving or stop_sent_count < _STOP_REPEAT:
-                if prev_moving:
-                    stop_sent_count = 0
-                if stop_sent_count < _STOP_REPEAT:
-                    _send_stop()
-                    stop_sent_count += 1
+                needs_resend = (now - last_cmd_time) > _RESEND_INTERVAL
 
-            prev_moving = is_moving
+                if not currently_moving or value_changed or needs_resend:
+                    ptz.continuous_move(pan, tilt, zoom)
+                    last_cmd_time = now
+                    if _DEBUG and (not currently_moving or value_changed):
+                        print(f"  → MOVE pan={pan:+.3f} tilt={tilt:+.3f} zoom={zoom:+.3f}")
+                    last_pan = pan
+                    last_tilt = tilt
+                    last_zoom = zoom
+                    currently_moving = True
+
+            elif currently_moving:
+                ptz.stop()
+                last_cmd_time = now
+                currently_moving = False
+                last_pan = 0.0
+                last_tilt = 0.0
+                last_zoom = 0.0
+                if _DEBUG:
+                    print("  ■ STOP")
 
             # ── Button (kurz=Screenshot, lang=Aufnahme) ──────
             btn_state = hw.joy_btn.is_pressed
-            now = time.time()
 
             if btn_state and not btn_last_state:
                 btn_press_time = now

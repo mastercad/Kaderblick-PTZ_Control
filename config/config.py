@@ -26,9 +26,8 @@ BTN_PIN = 17
 PAN_MAX  = 1.0
 TILT_MAX = 1.0
 ZOOM_MAX = 1.0
-DEADZONE = 0.08              # Jitter-Unterdrückung
-ZOOM_DEADZONE_LO = 400       # Poti-Mittelbereich (kein Zoom)
-ZOOM_DEADZONE_HI = 600
+DEADZONE = 0.12              # Joystick-Deadzone (relativ zu kalibrierter Mitte)
+ZOOM_DEADZONE = 0.15         # Zoom-Poti-Deadzone (breiter, da Poti weniger präzise)
 LOOP_SLEEP = 0.05            # 20 Hz Steuer-Loop
 
 # ── AI-Watchdog ──────────────────────────────────────────────
