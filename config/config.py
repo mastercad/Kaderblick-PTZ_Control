@@ -25,8 +25,9 @@ BTN_PIN = 17
 # ── PTZ-Einstellungen ────────────────────────────────────────
 PAN_MAX  = 1.0
 TILT_MAX = 1.0
+ZOOM_MAX = 1.0
 DEADZONE = 0.12              # Joystick-Deadzone (relativ zu kalibrierter Mitte)
-# Zoom: Poti steuert absolute Position (0%–100%), keine Deadzone nötig
+ZOOM_DEADZONE = 0.30         # Zoom-Poti-Deadzone (breit, damit leichtes Berühren nicht zoomt)
 LOOP_SLEEP = 0.05            # 20 Hz Steuer-Loop
 
 # ── AI-Watchdog ──────────────────────────────────────────────

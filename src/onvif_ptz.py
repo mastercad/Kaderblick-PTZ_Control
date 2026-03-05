@@ -12,7 +12,6 @@ ptz_service = None
 profile = None
 _move_req = None
 _stop_req = None
-_abs_move_req = None
 _error_count = 0
 _RECONNECT_AFTER = 3
 
@@ -59,7 +58,7 @@ def _discover_stream_uris():
 
 def init():
     """Erstverbindung zur Kamera herstellen. Einmal beim Start aufrufen."""
-    global cam, media_service, ptz_service, profile, _move_req, _stop_req, _abs_move_req
+    global cam, media_service, ptz_service, profile, _move_req, _stop_req
     print("Verbinde mit Kamera über ONVIF...")
     cam = ONVIFCamera(CAMERA_IP, CAMERA_PORT, USERNAME, PASSWORD)
     media_service = cam.create_media_service()
@@ -68,8 +67,6 @@ def init():
     profile = profiles[0]
     _move_req = ptz_service.create_type('ContinuousMove')
     _move_req.ProfileToken = profile.token
-    _abs_move_req = ptz_service.create_type('AbsoluteMove')
-    _abs_move_req.ProfileToken = profile.token
     _stop_req = {'ProfileToken': profile.token}
     print(f"Verbunden. Profil: {profile.Name}")
     _discover_stream_uris()
@@ -77,7 +74,7 @@ def init():
 
 def reconnect():
     """ONVIF-Verbindung komplett neu aufbauen."""
-    global cam, media_service, ptz_service, profile, _move_req, _stop_req, _abs_move_req
+    global cam, media_service, ptz_service, profile, _move_req, _stop_req
     try:
         print("  ↻ ONVIF Reconnect...")
         cam = ONVIFCamera(CAMERA_IP, CAMERA_PORT, USERNAME, PASSWORD)
@@ -87,8 +84,6 @@ def reconnect():
         profile = profiles[0]
         _move_req = ptz_service.create_type('ContinuousMove')
         _move_req.ProfileToken = profile.token
-        _abs_move_req = ptz_service.create_type('AbsoluteMove')
-        _abs_move_req.ProfileToken = profile.token
         _stop_req = {'ProfileToken': profile.token}
         print("  ✓ ONVIF Reconnect erfolgreich")
         return True
@@ -111,24 +106,6 @@ def continuous_move(pan, tilt, zoom_speed):
         _error_count += 1
         if _error_count == 1:
             print(f"PTZ ContinuousMove Fehler: {e}")
-        if _error_count >= _RECONNECT_AFTER:
-            reconnect()
-            _error_count = 0
-
-
-def absolute_zoom(position):
-    """Zoom auf absolute Position setzen (0.0 = kein Zoom, 1.0 = max Zoom)."""
-    global _error_count
-    try:
-        _abs_move_req.Position = {
-            'Zoom': {'x': float(max(0.0, min(1.0, position)))}
-        }
-        ptz_service.AbsoluteMove(_abs_move_req)
-        _error_count = 0
-    except Exception as e:
-        _error_count += 1
-        if _error_count == 1:
-            print(f"PTZ AbsoluteZoom Fehler: {e}")
         if _error_count >= _RECONNECT_AFTER:
             reconnect()
             _error_count = 0
